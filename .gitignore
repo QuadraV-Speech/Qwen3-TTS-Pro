@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.ruff_cache/
+
+# Local environments and patched upstream checkout
+.venv*/
+venv/
+third_party/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Runtime state, model cache and generated audio
+deployment/cache/
+deployment/run/
+deployment/output/
+*.pcm
+*.wav
+*.flac
+*.mp3
+
+# Build output
+build/
+dist/
+*.egg-info/

@@ -1,0 +1,13 @@
+Qwen3-TTS-Pro
+Copyright 2026 Qwen3-TTS-Pro contributors
+
+This project contains a patch derived from vLLM-Omni v0.26.0, which is
+licensed under the Apache License, Version 2.0. vLLM-Omni and vLLM are
+copyright their respective contributors.
+
+This project integrates with Qwen3-TTS models and links to documentation and
+assets from the Qwen3-TTS ecosystem. Qwen3-TTS model weights and trademarks
+are not included and remain subject to their upstream terms.
+
+Qwen3-TTS-Pro is an independent community engineering project. It is not an
+official Qwen, vLLM, or vLLM-Omni distribution.

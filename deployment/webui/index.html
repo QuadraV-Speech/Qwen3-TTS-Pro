@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#090b10" />
+    <title>Qwen3 TTS Pro</title>
+    <link rel="stylesheet" href="/static/style.css?v=18" />
+    <script src="/static/app.js?v=18" defer></script>
+  </head>
+  <body>
+    <div class="ambient ambient-one"></div>
+    <div class="ambient ambient-two"></div>
+    <div class="noise"></div>
+
+    <main class="shell">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="Qwen3 TTS Pro 首页">
+          <span class="brand-mark" aria-hidden="true">
+            <i></i><i></i><i></i><i></i><i></i>
+          </span>
+          <span>
+            <strong>Qwen3 <em>TTS</em> <b class="brand-pro">Pro</b></strong>
+            <small>PRO VOICE STUDIO</small>
+          </span>
+        </a>
+
+        <div class="top-actions">
+          <div class="model-chip" title="当前加载的模型">
+            <span class="model-dot"></span>
+            <span>1.7B CustomVoice</span>
+          </div>
+          <button id="backendStatus" class="status-pill checking" type="button" title="点击重新检测服务">
+            <span class="status-light"></span>
+            <span class="status-text">正在连接</span>
+          </button>
+        </div>
+      </header>
+
+      <section class="hero">
+        <div class="eyebrow"><span></span> LOCAL NEURAL SPEECH</div>
+        <h1>让文字，拥有<span>声音的温度</span></h1>
+        <p>基于 Qwen3-TTS 的本地语音工作台。选择音色与表达方式，即刻生成自然、细腻的语音。</p>
+      </section>
+
+      <section class="studio-grid">
+        <div class="panel composer-panel">
+          <div class="composer-columns">
+            <section class="composer-section input-section">
+              <div class="panel-head">
+                <div>
+                  <span class="step-number">01</span>
+                  <div>
+                    <h2>输入文本</h2>
+                    <p>写下你希望朗读的内容</p>
+                  </div>
+                </div>
+                <button id="clearButton" class="text-button" type="button">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2m-9 0 1 15h8l1-15M10 10v7m4-7v7"/></svg>
+                  清空
+                </button>
+              </div>
+
+              <div class="text-wrap">
+                <textarea id="inputText" maxlength="5000" spellcheck="false" placeholder="在这里输入需要合成的文本……">你好，欢迎使用 Qwen3 TTS 语音工作台。让每一句文字，都拥有自然真实的声音。</textarea>
+                <div class="text-footer">
+                  <div class="quick-prompts">
+                    <button type="button" data-example="welcome">产品介绍</button>
+                    <button type="button" data-example="narration">温柔旁白</button>
+                    <button type="button" data-example="news">新闻播报</button>
+                  </div>
+                  <span id="charCount">0 / 5000</span>
+                </div>
+              </div>
+            </section>
+
+            <section class="composer-section settings-section">
+              <div class="panel-head compact">
+                <div>
+                  <span class="step-number">02</span>
+                  <div>
+                    <h2>声音设置</h2>
+                    <p>音色、语言与表达方式</p>
+                  </div>
+                </div>
+              </div>
+
+              <div class="control-grid">
+                <label class="field">
+                  <span class="field-label">音色</span>
+                  <span class="select-wrap">
+                    <select id="voiceSelect" aria-label="选择音色"><option value="">加载中…</option></select>
+                  </span>
+                </label>
+                <label class="field">
+                  <span class="field-label">语言</span>
+                  <span class="select-wrap">
+                    <select id="languageSelect" aria-label="选择语言">
+                      <option value="Auto">自动识别</option><option value="Chinese" selected>中文</option>
+                      <option value="English">English</option><option value="Japanese">日本語</option>
+                      <option value="Korean">한국어</option><option value="German">Deutsch</option>
+                      <option value="French">Français</option><option value="Russian">Русский</option>
+                      <option value="Portuguese">Português</option><option value="Spanish">Español</option>
+                      <option value="Italian">Italiano</option>
+                    </select>
+                  </span>
+                </label>
+              </div>
+
+              <label class="field instruction-field">
+                <span class="field-label">表达指令 <small>可选</small></span>
+                <textarea id="instructions" rows="2" placeholder="例如：温柔舒缓，带一点微笑感"></textarea>
+              </label>
+
+              <div class="mode-row">
+                <div class="mode-copy">
+                  <span>生成模式</span>
+                  <small id="modeHint">模型级真实 token 输入，音频可在文本结束前返回</small>
+                </div>
+                <div class="segmented" role="group" aria-label="生成模式">
+                  <button class="mode-button active" data-mode="stream" type="button"><span class="pulse-icon"></span>Token 双流</button>
+                  <button class="mode-button" data-mode="full" type="button">完整音频</button>
+                </div>
+              </div>
+
+              <div id="fullOptions" class="full-options" aria-hidden="true">
+                <label class="field"><span class="field-label">输出格式</span><span class="select-wrap">
+                  <select id="formatSelect"><option value="wav">WAV</option><option value="mp3">MP3</option><option value="flac">FLAC</option><option value="aac">AAC</option><option value="opus">OPUS</option></select>
+                </span></label>
+                <label class="field range-field"><span class="field-label">语速 <strong id="speedValue">1.0×</strong></span><input id="speedRange" type="range" min="0.5" max="2" step="0.1" value="1" /></label>
+              </div>
+
+              <button id="generateButton" class="generate-button" type="button">
+                <span class="button-shine"></span><span class="generate-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h2m3-5v10m4-13v16m4-11v6m3-3h-1"/></svg></span>
+                <span class="button-label">开始生成</span><kbd>⌘ ↵</kbd>
+              </button>
+            </section>
+          </div>
+
+          <p id="errorMessage" class="error-message" role="alert"></p>
+          <div class="progress-track"><span id="progressBar"></span></div>
+
+          <div class="compact-output-bar">
+            <div class="output-summary">
+              <span id="playerBadge" class="player-badge idle"><i></i>就绪</span>
+              <h3 id="playerTitle">等待生成</h3>
+            </div>
+            <div class="metric-grid compact-metrics">
+              <div class="metric"><span>首包</span><strong id="ttfbMetric">—</strong></div>
+              <div class="metric"><span>时长</span><strong id="durationMetric">—</strong></div>
+              <div class="metric"><span>RTF</span><strong id="rtfMetric">—</strong></div>
+            </div>
+            <audio id="audioPlayer" controls preload="metadata"></audio>
+            <div class="player-actions compact-actions">
+              <button id="stopButton" class="secondary-button danger" type="button" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>停止</button>
+              <a id="downloadButton" class="secondary-button disabled" download="qwen3-tts.wav" aria-disabled="true"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m-5-5 5 5 5-5M5 21h14"/></svg>下载</a>
+            </div>
+          </div>
+        </div>
+
+        <section id="dualStreamCard" class="panel dual-stream-card timeline-panel" aria-label="模型双流实时监视器">
+          <div class="timeline-panel-head">
+            <div class="timeline-heading">
+              <span class="step-number">03</span>
+              <div>
+                <h2>双轨自回归推理</h2>
+                <p>上轨使用 T / E / P 紧凑标记，下轨对应 Codec 帧；整组双轨自动换行</p>
+              </div>
+            </div>
+            <span id="dualStreamState" class="dual-stream-state idle">等待任务</span>
+          </div>
+
+          <div class="model-track-monitor">
+            <div class="track-monitor-head">
+              <div>
+                <small>同列表示计算步骤配对，不代表字词与发音强对齐</small>
+              </div>
+              <div class="track-live-metrics">
+                <span id="codecGeneratedMetric">AR 0 帧</span>
+                <span id="codecBufferMetric">缓冲 0 帧</span>
+                <strong id="codecPlaybackMetric">PLAY —</strong>
+              </div>
+            </div>
+
+            <div id="dualTrackViewport" class="dual-track-viewport" role="region" aria-label="文本条件与 Codec 帧完整双轨轨迹">
+              <div id="dualTrackSurface" class="dual-track-surface">
+                <div class="paired-track-axis">
+                  <span class="text-axis"><strong>上轨 · TEXT</strong><small id="textStreamStatus">待机</small></span>
+                  <span class="codec-axis"><strong>下轨 · CODEC</strong><small id="audioStreamStatus">待机</small></span>
+                </div>
+                <div id="dualTrackItems" class="paired-token-grid"></div>
+              </div>
+            </div>
+
+            <div class="track-footer">
+              <div class="track-legend" aria-label="双轨图例">
+                <span class="token-legend"><i></i>T · Text Token</span>
+                <span class="eos-legend"><i></i>E · Text EOS</span>
+                <span class="pad-legend"><i></i>P · 内部 PAD</span>
+                <span class="generation-legend"><i></i>AR 提交</span>
+                <span class="codec-legend"><i></i>已生成 · 待播放</span>
+                <span class="playing-legend"><i></i>正在播放</span>
+                <span class="played-legend"><i></i>已播放</span>
+                <span class="playback-legend"><i></i>块内播放填充</span>
+              </div>
+              <span class="track-scroll-hint">同列上下配对 · 整组双轨换行 · 全量保留</span>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <footer>
+        <span>Qwen3-TTS-Pro · vLLM-Omni</span>
+        <span class="footer-dot"></span>
+        <span>24 kHz · Model-level Token Streaming</span>
+      </footer>
+    </main>
+
+    <div id="toast" class="toast" role="status"></div>
+  </body>
+</html>

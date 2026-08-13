@@ -1,0 +1,71 @@
+# Qwen3-TTS vLLM-Omni 0.26 profile for concurrent CustomVoice serving.
+# Both stages use logical GPU 0. Select the physical device with TTS_GPU.
+async_chunk: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      codec_streaming: true
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      codec_left_context_frames: 72
+      # Return the first audio fragment as soon as one codec frame is ready.
+      initial_codec_chunk_frames: 1
+      # Shapes used by the CustomVoice streaming path (first/steady/fallback).
+      decode_cudagraph_capture_sizes: [25, 73, 97, 169, 325]
+      # Qwen3-TTS-Pro: actively align steady-state codec chunks before Stage1.
+      # First/terminal chunks and single-request traffic bypass the wait.
+      codec_rendezvous_enabled: false
+      codec_rendezvous_target_batch_size: 2
+      codec_rendezvous_min_wait_ms: 0.10
+      codec_rendezvous_max_wait_ms: 0.50
+      codec_rendezvous_protect_first_packet: false
+      codec_rendezvous_stats_log_every: 100
+
+stages:
+  - stage_id: 0
+    # v0.26 batches Talker requests and uses async scheduling/CUDA Graph.
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.3
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 32768
+    max_model_len: 4096
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 4096
+      min_tokens: 2
+      repetition_penalty: 1.05
+    subtalker_sampling_params:
+      do_sample: true
+      temperature: 0.9
+      top_k: 50
+      top_p: 1.0
+
+  - stage_id: 1
+    # v0.26 can batch equal-length Code2Wav chunks from in-flight requests.
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.3
+    enforce_eager: false
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      repetition_penalty: 1.0

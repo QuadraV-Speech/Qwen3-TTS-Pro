@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  static-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Validate repository
+        run: ./scripts/validate_repo.sh
+
+  patch-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone supported vLLM-Omni baseline
+        run: git clone --depth 1 --branch v0.26.0 https://github.com/vllm-project/vllm-omni.git third_party/vllm-omni
+      - name: Check patch applicability
+        run: git -C third_party/vllm-omni apply --check ../../patches/vllm-omni-v0.26-qwen3-tts-pro.patch

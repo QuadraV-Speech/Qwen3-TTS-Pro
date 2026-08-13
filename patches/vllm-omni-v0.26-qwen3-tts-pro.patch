@@ -1,0 +1,2495 @@
+diff --git a/tests/core/sched/test_omni_ar_scheduler_streaming.py b/tests/core/sched/test_omni_ar_scheduler_streaming.py
+index ca80323..7bc9fe2 100644
+--- a/tests/core/sched/test_omni_ar_scheduler_streaming.py
++++ b/tests/core/sched/test_omni_ar_scheduler_streaming.py
+@@ -5,6 +5,7 @@
+ 
+ from __future__ import annotations
+ 
++from collections import deque
+ from types import SimpleNamespace
+ from unittest.mock import MagicMock
+ 
+@@ -19,6 +20,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
+ from vllm.v1.outputs import ModelRunnerOutput
+ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+ from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
++from vllm_omni.engine.serialization import serialize_additional_information
+ 
+ # isort: on
+ 
+@@ -28,6 +30,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+ def _make_scheduler(*, stage_id: int = 0) -> OmniARScheduler:
+     sched = OmniARScheduler.__new__(OmniARScheduler)
+     sched._new_prompt_len_snapshot = {}
++    sched._qwen3_tts_live_text_updates = {}
++    sched._qwen3_tts_live_text_done = set()
++    sched._qwen3_tts_paused_for_text = set()
+     sched.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=stage_id))
+     sched.num_waiting_for_streaming_input = 0
+     sched.log_stats = False
+@@ -249,6 +254,149 @@ def test_stage0_streaming_update_keeps_all_computed_tokens_without_placeholder()
+     assert sched._new_prompt_len_snapshot[session.request_id] == 2
+ 
+ 
++def test_running_qwen3_tts_text_delta_is_hot_appended_without_prompt_mutation() -> None:
++    sched = _make_scheduler(stage_id=0)
++    session = _make_request()
++    session.status = RequestStatus.RUNNING
++    session.resumable = True
++    session.streaming_queue = deque()
++    sched.requests = {session.request_id: session}
++    sched._qwen3_tts_live_text_updates = {}
++
++    update_request = Request(
++        request_id=session.request_id,
++        prompt_token_ids=[0],
++        sampling_params=SamplingParams(max_tokens=8),
++        pooling_params=None,
++        block_hasher=None,
++        resumable=True,
++        additional_information=serialize_additional_information(
++            {"qwen3_tts_streaming_text_delta": "新文本"}
++        ),
++    )
++    original_prompt = list(session.prompt_token_ids)
++
++    sched.add_request(update_request)
++
++    assert session.prompt_token_ids == original_prompt
++    assert list(session.streaming_queue) == []
++    assert sched._qwen3_tts_live_text_updates == {session.request_id: "新文本"}
++
++
++def test_running_qwen3_tts_token_ids_are_coalesced_without_prompt_mutation() -> None:
++    sched = _make_scheduler(stage_id=0)
++    session = _make_request()
++    session.status = RequestStatus.RUNNING
++    session.resumable = True
++    session.streaming_queue = deque()
++    sched.requests = {session.request_id: session}
++    sched._qwen3_tts_live_text_token_updates = {}
++    original_prompt = list(session.prompt_token_ids)
++
++    for token_ids in ([101, 102], [103]):
++        sched.add_request(
++            Request(
++                request_id=session.request_id,
++                prompt_token_ids=[0],
++                sampling_params=SamplingParams(max_tokens=8),
++                pooling_params=None,
++                block_hasher=None,
++                resumable=True,
++                additional_information=serialize_additional_information(
++                    {"qwen3_tts_streaming_text_token_ids": token_ids}
++                ),
++            )
++        )
++
++    assert session.prompt_token_ids == original_prompt
++    assert list(session.streaming_queue) == []
++    assert sched._qwen3_tts_live_text_token_updates == {session.request_id: [101, 102, 103]}
++
++
++def test_running_qwen3_tts_done_marker_is_hot_appended_without_prompt_mutation() -> None:
++    sched = _make_scheduler(stage_id=0)
++    session = _make_request()
++    session.status = RequestStatus.RUNNING
++    session.resumable = True
++    session.streaming_queue = deque()
++    sched.requests = {session.request_id: session}
++    update_request = Request(
++        request_id=session.request_id,
++        prompt_token_ids=[0],
++        sampling_params=SamplingParams(max_tokens=8),
++        pooling_params=None,
++        block_hasher=None,
++        resumable=True,
++        additional_information=serialize_additional_information(
++            {"qwen3_tts_streaming_input_done": True}
++        ),
++    )
++    original_prompt = list(session.prompt_token_ids)
++
++    sched.add_request(update_request)
++
++    assert session.prompt_token_ids == original_prompt
++    assert list(session.streaming_queue) == []
++    assert sched._qwen3_tts_live_text_done == {session.request_id}
++    assert session.resumable is False
++
++
++def test_qwen3_tts_text_delta_unfreezes_paused_running_request() -> None:
++    sched = _make_scheduler(stage_id=0)
++    session = _make_request()
++    session.status = RequestStatus.RUNNING
++    session.next_decode_eligible_step = 1 << 60
++    session.streaming_queue = deque()
++    sched.requests = {session.request_id: session}
++    sched._qwen3_tts_paused_for_text.add(session.request_id)
++    update_request = Request(
++        request_id=session.request_id,
++        prompt_token_ids=[0],
++        sampling_params=SamplingParams(max_tokens=8),
++        pooling_params=None,
++        block_hasher=None,
++        resumable=True,
++        additional_information=serialize_additional_information(
++            {"qwen3_tts_streaming_text_delta": "续"}
++        ),
++    )
++
++    sched.add_request(update_request)
++
++    assert session.status == RequestStatus.RUNNING
++    assert session.next_decode_eligible_step == 0
++    assert session.request_id not in sched._qwen3_tts_paused_for_text
++    assert sched._qwen3_tts_live_text_updates == {session.request_id: "续"}
++
++
++def test_qwen3_tts_delta_waits_for_stale_async_frames_before_unfreezing() -> None:
++    sched = _make_scheduler(stage_id=0)
++    session = _make_request()
++    session.status = RequestStatus.RUNNING
++    session.next_decode_eligible_step = 1 << 60
++    session.async_tokens_to_discard = 1
++    session.streaming_queue = deque()
++    sched.requests = {session.request_id: session}
++    sched._qwen3_tts_paused_for_text.add(session.request_id)
++    update_request = Request(
++        request_id=session.request_id,
++        prompt_token_ids=[0],
++        sampling_params=SamplingParams(max_tokens=8),
++        pooling_params=None,
++        block_hasher=None,
++        resumable=True,
++        additional_information=serialize_additional_information(
++            {"qwen3_tts_streaming_text_delta": "续"}
++        ),
++    )
++
++    sched.add_request(update_request)
++
++    assert session.next_decode_eligible_step == 1 << 60
++    assert session.request_id in sched._qwen3_tts_paused_for_text
++    assert sched._qwen3_tts_live_text_updates == {session.request_id: "续"}
++
++
+ def test_explicit_streaming_payload_replaces_placeholder_prompt() -> None:
+     sched = _make_scheduler(stage_id=1)
+     sched.chunk_transfer_adapter = SimpleNamespace(
+diff --git a/tests/distributed/omni_connectors/test_chunk_transfer_adapter.py b/tests/distributed/omni_connectors/test_chunk_transfer_adapter.py
+index e1a1e36..b9cf8be 100644
+--- a/tests/distributed/omni_connectors/test_chunk_transfer_adapter.py
++++ b/tests/distributed/omni_connectors/test_chunk_transfer_adapter.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import threading
++import time
+ from collections import deque
+ from types import SimpleNamespace
+ from unittest.mock import patch
+@@ -572,6 +573,195 @@ def test_process_and_restore_queues(build_adapter):
+     assert adapter.waiting_for_chunk_running_requests == deque()
+ 
+ 
++def _steady_codec_request(req_id: str):
++    request = _req(req_id, RequestStatus.WAITING_FOR_CHUNK)
++    request.prompt_token_ids = [0] * (16 * 97)
++    request.additional_information = {
++        "meta": {
++            "ref_context_size": 72,
++            "ref_context_included": False,
++        },
++    }
++    return request
++
++
++def test_codec_rendezvous_bypasses_first_chunk_without_sleep(build_adapter, monkeypatch):
++    adapter, _ = build_adapter(
++        stage_id=1,
++        model_mode="generation",
++        max_num_seqs=8,
++        connector_extra={"codec_rendezvous_enabled": True},
++    )
++    first = _steady_codec_request("first")
++    peer = _steady_codec_request("peer")
++    adapter.get_req_chunk[first.request_id] = 1
++    adapter.get_req_chunk[peer.request_id] = 2
++    adapter._finished_load_reqs.add(first.request_id)
++    monkeypatch.setattr(time, "sleep", lambda _seconds: pytest.fail("first chunk must not wait"))
++
++    selected = adapter._select_codec_rendezvous_ready({first.request_id: first, peer.request_id: peer})
++
++    assert selected == {first.request_id}
++    assert adapter._codec_rendezvous_stats["cause_bypass"] == 1
++
++
++def test_codec_rendezvous_bypass_does_not_release_partial_steady_bucket(build_adapter, monkeypatch):
++    adapter, _ = build_adapter(
++        stage_id=1,
++        model_mode="generation",
++        max_num_seqs=8,
++        connector_extra={
++            "codec_rendezvous_enabled": True,
++            "codec_rendezvous_target_batch_size": 4,
++        },
++    )
++    first = _steady_codec_request("first")
++    steady = _steady_codec_request("steady")
++    requests = {request.request_id: request for request in (first, steady)}
++    adapter.get_req_chunk[first.request_id] = 1
++    adapter.get_req_chunk[steady.request_id] = 2
++    adapter._finished_load_reqs.update(requests)
++    monkeypatch.setattr(time, "sleep", lambda _seconds: pytest.fail("first chunk must not wait"))
++
++    selected = adapter._select_codec_rendezvous_ready(requests)
++
++    assert selected == {first.request_id}
++    assert steady.request_id in adapter._finished_load_reqs
++    assert adapter._codec_rendezvous_stats["cause_bypass"] == 1
++
++
++def test_codec_rendezvous_slo_bypasses_while_peer_awaits_first_chunk(build_adapter, monkeypatch):
++    adapter, _ = build_adapter(
++        stage_id=1,
++        model_mode="generation",
++        max_num_seqs=8,
++        connector_extra={"codec_rendezvous_enabled": True},
++    )
++    steady = _steady_codec_request("steady")
++    awaiting_first = _steady_codec_request("awaiting-first")
++    requests = {request.request_id: request for request in (steady, awaiting_first)}
++    adapter.get_req_chunk[steady.request_id] = 2
++    adapter.get_req_chunk[awaiting_first.request_id] = 0
++    adapter._finished_load_reqs.add(steady.request_id)
++    monkeypatch.setattr(
++        adapter._codec_rendezvous_cond,
++        "wait",
++        lambda _timeout: pytest.fail("steady chunk must not wait while a first chunk is pending"),
++    )
++
++    selected = adapter._select_codec_rendezvous_ready(requests)
++
++    assert selected == {steady.request_id}
++    assert adapter._codec_rendezvous_stats["cause_slo_bypass"] == 1
++
++
++def test_codec_rendezvous_releases_full_shape_bucket_without_sleep(build_adapter, monkeypatch):
++    adapter, _ = build_adapter(
++        stage_id=1,
++        model_mode="generation",
++        max_num_seqs=8,
++        connector_extra={
++            "codec_rendezvous_enabled": True,
++            "codec_rendezvous_target_batch_size": 4,
++        },
++    )
++    requests = {f"r{i}": _steady_codec_request(f"r{i}") for i in range(4)}
++    for req_id in requests:
++        adapter.get_req_chunk[req_id] = 2
++    adapter._finished_load_reqs.update(requests)
++    monkeypatch.setattr(time, "sleep", lambda _seconds: pytest.fail("full bucket must not wait"))
++
++    selected = adapter._select_codec_rendezvous_ready(requests)
++
++    assert selected == set(requests)
++    assert adapter._codec_rendezvous_stats["cause_target"] == 1
++    assert adapter._codec_rendezvous_batch_hist[4] == 1
++
++
++def test_codec_rendezvous_full_bucket_does_not_release_incompatible_partial_bucket(
++    build_adapter, monkeypatch
++):
++    adapter, _ = build_adapter(
++        stage_id=1,
++        model_mode="generation",
++        max_num_seqs=8,
++        connector_extra={
++            "codec_rendezvous_enabled": True,
++            "codec_rendezvous_target_batch_size": 2,
++        },
++    )
++    requests = {req_id: _steady_codec_request(req_id) for req_id in ("r1", "r2", "partial")}
++    requests["partial"].prompt_token_ids = [0] * (16 * 169)
++    for req_id in requests:
++        adapter.get_req_chunk[req_id] = 2
++    adapter._finished_load_reqs.update(requests)
++    monkeypatch.setattr(time, "sleep", lambda _seconds: pytest.fail("full bucket must not wait"))
++
++    selected = adapter._select_codec_rendezvous_ready(requests)
++
++    assert selected == {"r1", "r2"}
++    assert "partial" in adapter._finished_load_reqs
++    assert adapter._codec_rendezvous_stats["cause_target"] == 1
++    assert adapter._codec_rendezvous_batch_hist[2] == 1
++
++
++def test_codec_rendezvous_collects_peer_during_bounded_wait(build_adapter, monkeypatch):
++    adapter, _ = build_adapter(
++        stage_id=1,
++        model_mode="generation",
++        max_num_seqs=8,
++        connector_extra={
++            "codec_rendezvous_enabled": True,
++            "codec_rendezvous_target_batch_size": 2,
++            "codec_rendezvous_min_wait_ms": 1,
++            "codec_rendezvous_max_wait_ms": 1,
++        },
++    )
++    requests = {req_id: _steady_codec_request(req_id) for req_id in ("r1", "r2")}
++    for req_id in requests:
++        adapter.get_req_chunk[req_id] = 2
++    adapter._finished_load_reqs.add("r1")
++    wait_calls = []
++
++    def _arrive_during_wait(timeout):
++        wait_calls.append(timeout)
++        adapter._finished_load_reqs.add("r2")
++        adapter._codec_rendezvous_arrival_epoch += 1
++
++    monkeypatch.setattr(adapter._codec_rendezvous_cond, "wait", _arrive_during_wait)
++
++    selected = adapter._select_codec_rendezvous_ready(requests)
++
++    assert wait_calls
++    assert selected == {"r1", "r2"}
++    assert adapter._codec_rendezvous_stats["cause_target"] == 1
++    assert adapter._codec_rendezvous_batch_hist[2] == 1
++
++
++def test_codec_rendezvous_deadline_releases_partial_bucket(build_adapter):
++    adapter, _ = build_adapter(
++        stage_id=1,
++        model_mode="generation",
++        max_num_seqs=8,
++        connector_extra={
++            "codec_rendezvous_enabled": True,
++            "codec_rendezvous_target_batch_size": 4,
++            "codec_rendezvous_min_wait_ms": 0.1,
++            "codec_rendezvous_max_wait_ms": 0.1,
++        },
++    )
++    requests = {req_id: _steady_codec_request(req_id) for req_id in ("r1", "r2")}
++    adapter.get_req_chunk["r1"] = 2
++    adapter.get_req_chunk["r2"] = 2
++    adapter._finished_load_reqs.add("r1")
++
++    selected = adapter._select_codec_rendezvous_ready(requests)
++
++    assert selected == {"r1"}
++    assert adapter._codec_rendezvous_stats["cause_deadline"] == 1
++    assert adapter._codec_rendezvous_stats["wait_us"] > 0
++
++
+ def test_fifo_promotion(build_adapter):
+     adapter, _ = build_adapter(stage_id=1, model_mode="generation", max_num_seqs=2, active_stream_window=2)
+     reqs = [_req(f"req-{idx}", RequestStatus.WAITING) for idx in range(1, 5)]
+diff --git a/tests/entrypoints/openai_api/test_serving_speech_stream.py b/tests/entrypoints/openai_api/test_serving_speech_stream.py
+index 44e84b3..e409f54 100644
+--- a/tests/entrypoints/openai_api/test_serving_speech_stream.py
++++ b/tests/entrypoints/openai_api/test_serving_speech_stream.py
+@@ -21,6 +21,7 @@ def _build_test_app(
+     *,
+     idle_timeout=30.0,
+     config_timeout=10.0,
++    model_streaming_finalize_timeout=30.0,
+     mocker: MockerFixture | None = None,
+ ):
+     if speech_service is None:
+@@ -42,6 +43,7 @@ def _build_test_app(
+         speech_service=speech_service,
+         idle_timeout=idle_timeout,
+         config_timeout=config_timeout,
++        model_streaming_finalize_timeout=model_streaming_finalize_timeout,
+     )
+     app = FastAPI()
+ 
+@@ -290,6 +292,193 @@ class TestStreamingSpeechWebSocket:
+         assert captured_requests[0].initial_codec_chunk_frames == 12
+         assert speech_service._generate_audio_bytes.await_count == 0
+ 
++    def test_model_streaming_input_returns_audio_before_input_done(self, mocker: MockerFixture):
++        captured_requests = []
++        captured_deltas = []
++        input_closed = asyncio.Event()
++
++        speech_service = mocker.MagicMock(spec=OmniOpenAIServingSpeech)
++        speech_service._generate_audio_bytes = mocker.AsyncMock(return_value=(b"", "audio/wav"))
++        speech_service.engine_client = mocker.MagicMock()
++        speech_service.engine_client.abort = mocker.AsyncMock()
++        speech_service.forced_aligner_config = None
++
++        async def mock_prepare_speech_generation(request, *, streaming_text_input=None):
++            captured_requests.append(request)
++            assert streaming_text_input is not None
++
++            async def consume_text_updates():
++                async for delta in streaming_text_input:
++                    captured_deltas.append(delta)
++                input_closed.set()
++
++            asyncio.create_task(consume_text_updates())
++            return "req-native-stream", object(), {}
++
++        speech_service._prepare_speech_generation = mock_prepare_speech_generation
++
++        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False):
++            first = b"\x01\x02"
++            yield (first, 24000) if include_sample_rate else first
++            await input_closed.wait()
++            final = b"\x03\x04"
++            yield (final, 24000) if include_sample_rate else final
++
++        speech_service._generate_pcm_chunks = mock_generate_pcm_chunks
++        app, _ = _build_test_app(speech_service)
++
++        with TestClient(app) as client:
++            with client.websocket_connect("/v1/audio/speech/stream") as ws:
++                ws.send_json(
++                    {
++                        "type": "session.config",
++                        "voice": "Vivian",
++                        "stream_audio": True,
++                        "response_format": "pcm",
++                        "model_streaming_input": True,
++                    }
++                )
++                ws.send_json({"type": "input.text", "text": "你"})
++
++                start = ws.receive_json()
++                assert start["type"] == "audio.start"
++                assert start["model_streaming_input"] is True
++                # This frame arrives while the client has deliberately not sent
++                # input.done, proving receive and generation run concurrently.
++                assert ws.receive_bytes() == b"\x01\x02"
++
++                ws.send_json({"type": "input.text", "text": "好"})
++                ws.send_json({"type": "input.done"})
++                assert ws.receive_bytes() == b"\x03\x04"
++                assert ws.receive_json()["type"] == "audio.done"
++                assert ws.receive_json() == {
++                    "type": "session.done",
++                    "utterance_index": 0,
++                    "total_sentences": 1,
++                }
++
++        assert captured_requests[0].input == "你"
++        assert captured_requests[0].non_streaming_mode is False
++        assert captured_deltas == ["好"]
++
++    def test_model_streaming_token_plan_preserves_exact_token_sequence(self, mocker: MockerFixture):
++        captured_deltas = []
++        captured_initial_ids = []
++        input_closed = asyncio.Event()
++
++        class FakeTokenizer:
++            def __call__(self, _text, **_kwargs):
++                return {"input_ids": [10, 11, 12, 101, 102, 103, 20, 21, 22, 23, 24]}
++
++            def convert_ids_to_tokens(self, token_id):
++                return {101: "你", 102: "好", 103: "！"}[token_id]
++
++        speech_service = mocker.MagicMock(spec=OmniOpenAIServingSpeech)
++        speech_service._get_usage_text_tokenizer.return_value = FakeTokenizer()
++        speech_service._generate_audio_bytes = mocker.AsyncMock(return_value=(b"", "audio/wav"))
++        speech_service.engine_client = mocker.MagicMock()
++        speech_service.engine_client.abort = mocker.AsyncMock()
++        speech_service.forced_aligner_config = None
++
++        async def mock_prepare_speech_generation(
++            request,
++            *,
++            streaming_text_input=None,
++            streaming_initial_text_token_ids=None,
++        ):
++            captured_initial_ids.extend(streaming_initial_text_token_ids)
++
++            async def consume_text_updates():
++                async for delta in streaming_text_input:
++                    captured_deltas.append(delta)
++                input_closed.set()
++
++            asyncio.create_task(consume_text_updates())
++            return "req-token-stream", object(), {}
++
++        speech_service._prepare_speech_generation = mock_prepare_speech_generation
++
++        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False):
++            yield b"\x01\x02"
++            await input_closed.wait()
++            yield b"\x03\x04"
++
++        speech_service._generate_pcm_chunks = mock_generate_pcm_chunks
++        app, _ = _build_test_app(speech_service)
++
++        with TestClient(app) as client:
++            with client.websocket_connect("/v1/audio/speech/stream") as ws:
++                ws.send_json(
++                    {
++                        "type": "session.config",
++                        "voice": "Vivian",
++                        "stream_audio": True,
++                        "response_format": "pcm",
++                        "model_streaming_input": True,
++                    }
++                )
++                ws.send_json({"type": "input.plan", "text": "你好！"})
++                assert ws.receive_json() == {
++                    "type": "input.plan.ready",
++                    "token_ids": [101, 102, 103],
++                    "tokens": ["你", "好", "！"],
++                    "token_count": 3,
++                }
++                ws.send_json({"type": "input.tokens", "token_ids": [101, 102]})
++                assert ws.receive_json()["type"] == "audio.start"
++                assert ws.receive_bytes() == b"\x01\x02"
++                ws.send_json({"type": "input.tokens", "token_ids": [103]})
++                ws.send_json({"type": "input.done"})
++                assert ws.receive_bytes() == b"\x03\x04"
++                assert ws.receive_json()["type"] == "audio.done"
++                assert ws.receive_json()["type"] == "session.done"
++
++        assert captured_initial_ids == [10, 11, 12, 101, 102, 20, 21, 22, 23, 24]
++        assert captured_deltas == [[103]]
++
++    def test_model_streaming_finalize_timeout_aborts_request(self, mocker: MockerFixture):
++        speech_service = mocker.MagicMock(spec=OmniOpenAIServingSpeech)
++        speech_service._generate_audio_bytes = mocker.AsyncMock(return_value=(b"", "audio/wav"))
++        speech_service._prepare_speech_generation = mocker.AsyncMock(
++            return_value=("req-native-timeout", object(), {})
++        )
++        speech_service.engine_client = mocker.MagicMock()
++        speech_service.engine_client.abort = mocker.AsyncMock()
++        speech_service.forced_aligner_config = None
++
++        async def never_finishes(_generator, _request_id, *, include_sample_rate=False):
++            yield (b"\x01\x02", 24000) if include_sample_rate else b"\x01\x02"
++            await asyncio.Event().wait()
++
++        speech_service._generate_pcm_chunks = never_finishes
++        app, _ = _build_test_app(
++            speech_service,
++            model_streaming_finalize_timeout=0.05,
++        )
++
++        with TestClient(app) as client:
++            with client.websocket_connect("/v1/audio/speech/stream") as ws:
++                ws.send_json(
++                    {
++                        "type": "session.config",
++                        "voice": "Vivian",
++                        "stream_audio": True,
++                        "response_format": "pcm",
++                        "model_streaming_input": True,
++                    }
++                )
++                ws.send_json({"type": "input.text", "text": "你"})
++                assert ws.receive_json()["type"] == "audio.start"
++                assert ws.receive_bytes() == b"\x01\x02"
++                ws.send_json({"type": "input.done"})
++
++                events = [ws.receive_json(), ws.receive_json(), ws.receive_json()]
++                assert [event["type"] for event in events] == ["audio.done", "error", "session.done"]
++                assert events[0]["error"] is True
++                assert "finalization timed out" in events[1]["message"]
++
++        speech_service.engine_client.abort.assert_awaited_once_with("req-native-timeout")
++
+     def test_word_timestamps_requires_configured_aligner(self, mocker: MockerFixture):
+         app, _ = _build_test_app(mocker=mocker)
+ 
+diff --git a/tests/model_executor/models/qwen3_tts/test_qwen3_tts_talker_preprocess.py b/tests/model_executor/models/qwen3_tts/test_qwen3_tts_talker_preprocess.py
+index c76583a..f2a3f87 100644
+--- a/tests/model_executor/models/qwen3_tts/test_qwen3_tts_talker_preprocess.py
++++ b/tests/model_executor/models/qwen3_tts/test_qwen3_tts_talker_preprocess.py
+@@ -35,7 +35,7 @@ def _make_minimal_talker(
+     tests don't exercise the builder).
+     """
+     model = Qwen3TTSTalkerForConditionalGeneration.__new__(Qwen3TTSTalkerForConditionalGeneration)
+-    model.talker_config = SimpleNamespace(codec_pad_id=7, num_code_groups=16)
++    model.talker_config = SimpleNamespace(codec_pad_id=7, num_code_groups=16, hidden_size=4)
+     model._embedding_dtype = torch.bfloat16
+     if tts_pad_embed is None:
+         tts_pad_embed = torch.zeros((1, 4), dtype=torch.bfloat16)
+@@ -47,6 +47,9 @@ def _make_minimal_talker(
+     model._embedding_dtype = torch.bfloat16
+     model._prompt_builder = SimpleNamespace(
+         build_prompt_embeds=build_prompt_embeds if build_prompt_embeds is not None else _default_raise,
++        build_streaming_text_hidden=lambda _text, **_kwargs: (_ for _ in ()).throw(
++            AssertionError("build_streaming_text_hidden was not stubbed in this test")
++        ),
+     )
+     return model
+ 
+@@ -192,6 +195,177 @@ def test_decode_advances_trailing_text_by_offset_without_rewriting_tail():
+     assert torch.equal(text_step.cpu(), trailing_text[1:2].to(torch.bfloat16))
+ 
+ 
++def test_live_text_delta_replaces_pending_eos_and_preserves_unconsumed_queue():
++    model = _make_minimal_talker()
++    model.embed_input_ids = lambda input_ids: input_ids.to(torch.float32).reshape(1, 1, 1).expand(1, 1, 4)
++    appended = torch.tensor([[20.0] * 4])
++    model._prompt_builder.build_streaming_text_hidden = lambda text, *, append_eos: appended
++
++    old_tail = torch.tensor([[1.0] * 4, [2.0] * 4, [99.0] * 4])
++    hidden_states = {
++        "trailing_text": old_tail,
++        "last": torch.full((4,), 3.0),
++    }
++    meta = {
++        "talker_text_offset": 1,
++        "trailing_text_has_eos": True,
++    }
++
++    _, _, update = model.preprocess(
++        input_ids=torch.tensor([123]),
++        input_embeds=None,
++        text=["old"],
++        task_type=["CustomVoice"],
++        hidden_states=hidden_states,
++        meta=meta,
++        qwen3_tts_streaming_text_delta="new",
++        _omni_is_prefill=False,
++        _omni_num_computed_tokens=2,
++        _omni_prompt_len=2,
++    )
++
++    expected_queue = torch.tensor([[2.0] * 4, [20.0] * 4], dtype=torch.bfloat16)
++    assert torch.equal(hidden_states["trailing_text"].cpu(), expected_queue)
++    assert torch.equal(update["mtp_inputs"][1].cpu(), expected_queue[:1])
++    assert update["meta"]["talker_text_offset"] == 1
++    assert update["meta"]["qwen3_tts_streaming_input_open"] is True
++    assert update["qwen3_tts_streaming_text_delta"] == ""
++    assert update["qwen3_tts_streaming_input_done"] is False
++
++
++def test_live_text_token_ids_use_token_native_projection_path():
++    model = _make_minimal_talker()
++    model.embed_input_ids = lambda input_ids: input_ids.to(torch.float32).reshape(1, 1, 1).expand(1, 1, 4)
++    appended = torch.tensor([[20.0] * 4, [21.0] * 4])
++    captured: list[tuple[list[int], bool]] = []
++
++    def build_from_ids(token_ids, *, append_eos):
++        captured.append((list(token_ids), append_eos))
++        return appended
++
++    model._prompt_builder.build_streaming_text_hidden_from_token_ids = build_from_ids
++    hidden_states = {
++        "trailing_text": torch.tensor([[1.0] * 4]),
++        "last": torch.full((4,), 3.0),
++    }
++
++    _, _, update = model.preprocess(
++        input_ids=torch.tensor([123]),
++        input_embeds=None,
++        text=["full utterance"],
++        task_type=["CustomVoice"],
++        hidden_states=hidden_states,
++        meta={"talker_text_offset": 0, "trailing_text_has_eos": False},
++        qwen3_tts_streaming_text_token_ids=[101, 102],
++        _omni_is_prefill=False,
++        _omni_num_computed_tokens=2,
++        _omni_prompt_len=2,
++    )
++
++    assert captured == [([101, 102], False)]
++    assert torch.equal(hidden_states["trailing_text"].cpu(), torch.tensor([[1.0] * 4, [20.0] * 4, [21.0] * 4], dtype=torch.bfloat16))
++    assert update["qwen3_tts_streaming_text_token_ids"] == []
++
++
++def test_live_text_done_appends_the_only_terminal_eos_row():
++    model = _make_minimal_talker()
++    model.embed_input_ids = lambda input_ids: input_ids.to(torch.float32).reshape(1, 1, 1).expand(1, 1, 4)
++    eos = torch.tensor([[99.0] * 4])
++    model._prompt_builder.build_streaming_text_hidden = lambda text, *, append_eos: eos
++    hidden_states = {
++        "trailing_text": torch.tensor([[20.0] * 4]),
++        "last": torch.full((4,), 3.0),
++    }
++    meta = {
++        "talker_text_offset": 0,
++        "trailing_text_has_eos": False,
++        "qwen3_tts_streaming_input_open": True,
++    }
++
++    _, _, update = model.preprocess(
++        input_ids=torch.tensor([123]),
++        input_embeds=None,
++        text=["old"],
++        task_type=["CustomVoice"],
++        hidden_states=hidden_states,
++        meta=meta,
++        qwen3_tts_streaming_input_done=True,
++        _omni_is_prefill=False,
++        _omni_num_computed_tokens=2,
++        _omni_prompt_len=2,
++    )
++
++    expected_queue = torch.tensor([[20.0] * 4, [99.0] * 4], dtype=torch.bfloat16)
++    assert torch.equal(hidden_states["trailing_text"].cpu(), expected_queue)
++    assert torch.equal(update["mtp_inputs"][1].cpu(), expected_queue[:1])
++    assert update["meta"]["qwen3_tts_streaming_input_open"] is False
++    assert update["qwen3_tts_streaming_input_done"] is False
++
++
++def test_model_streaming_prefill_withholds_terminal_text_eos_until_done():
++    full_prompt_embeds = torch.arange(8, dtype=torch.float32).reshape(2, 4)
++    content_and_eos = torch.tensor([[10.0] * 4, [99.0] * 4])
++
++    def fake_build_prompt_embeds(*, task_type, info_dict):
++        return full_prompt_embeds, content_and_eos, None, None
++
++    model = _make_minimal_talker(build_prompt_embeds=fake_build_prompt_embeds)
++    _, _, update = model.preprocess(
++        input_ids=torch.tensor([123]),
++        input_embeds=None,
++        text=["hello"],
++        task_type=["CustomVoice"],
++        qwen3_tts_streaming_input_open=[True],
++        _omni_is_prefill=True,
++        _omni_num_computed_tokens=0,
++        _omni_prompt_len=2,
++    )
++
++    assert torch.equal(update["hidden_states"]["trailing_text"], content_and_eos[:-1])
++    assert update["meta"]["trailing_text_has_eos"] is False
++    assert update["meta"]["qwen3_tts_streaming_input_open"] is True
++
++
++def test_model_streaming_decode_marks_empty_open_text_queue_for_pause():
++    model = _make_minimal_talker()
++    info = {
++        "codes": {"audio": torch.zeros((1, 16), dtype=torch.long)},
++        "hidden_states": {"trailing_text": torch.empty((0, 4))},
++        "meta": {
++            "talker_text_offset": 0,
++            "qwen3_tts_streaming_input_open": True,
++        },
++        "_omni_is_prefill": False,
++    }
++
++    output = model.make_omni_output(
++        torch.zeros((1, 4)),
++        model_intermediate_buffer=[info],
++    )
++
++    assert output.multimodal_outputs["meta"]["qwen3_tts_waiting_for_text"].tolist() == [1]
++
++
++def test_model_streaming_prefill_never_requests_text_pause():
++    model = _make_minimal_talker()
++    info = {
++        "codes": {"audio": torch.zeros((1, 16), dtype=torch.long)},
++        "hidden_states": {"trailing_text": torch.empty((0, 4))},
++        "meta": {
++            "talker_text_offset": 0,
++            "qwen3_tts_streaming_input_open": True,
++        },
++        "_omni_is_prefill": True,
++    }
++
++    output = model.make_omni_output(
++        torch.zeros((1, 4)),
++        model_intermediate_buffer=[info],
++    )
++
++    assert output.multimodal_outputs["meta"]["qwen3_tts_waiting_for_text"].tolist() == [0]
++
++
+ def test_decode_advances_trailing_text_offset_across_multiple_steps():
+     tts_pad = torch.full((1, 4), -1.0, dtype=torch.bfloat16)
+     model = _make_minimal_talker(tts_pad_embed=tts_pad)
+diff --git a/vllm_omni/core/sched/omni_ar_scheduler.py b/vllm_omni/core/sched/omni_ar_scheduler.py
+index 514cc9b..c99d88e 100644
+--- a/vllm_omni/core/sched/omni_ar_scheduler.py
++++ b/vllm_omni/core/sched/omni_ar_scheduler.py
+@@ -127,6 +127,104 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
+         self._latest_omni_connector_output: OmniConnectorOutput | None = None
+         # Snapshot prompt length for each streaming input update
+         self._new_prompt_len_snapshot: dict[str, int] = {}
++        # Metadata-only Qwen3-TTS text deltas waiting to be delivered to the
++        # GPU runner. Unlike a normal streaming update these do not extend the
++        # token prompt: the Talker keeps decoding from its existing KV cache
++        # while only its trailing text-conditioning queue grows.
++        self._qwen3_tts_live_text_updates: dict[str, str] = {}
++        self._qwen3_tts_live_text_token_updates: dict[str, list[int]] = {}
++        self._qwen3_tts_live_text_done: set[str] = set()
++        # Requests whose Talker has consumed all text currently available.
++        # Keep them RUNNING so their KV allocation and async decode accounting
++        # stay intact; next_decode_eligible_step is used as a lightweight gate
++        # until another text delta (or the final input-done marker) arrives.
++        self._qwen3_tts_paused_for_text: set[str] = set()
++
++    @staticmethod
++    def _qwen3_tts_streaming_text_delta(update: StreamingUpdate | None) -> str | None:
++        if update is None:
++            return None
++        info = deserialize_additional_information(getattr(update, "additional_information", None))
++        value = info.get("qwen3_tts_streaming_text_delta")
++        return value if isinstance(value, str) and value else None
++
++    @staticmethod
++    def _qwen3_tts_streaming_text_token_ids(update: StreamingUpdate | None) -> list[int] | None:
++        if update is None:
++            return None
++        info = deserialize_additional_information(getattr(update, "additional_information", None))
++        value = info.get("qwen3_tts_streaming_text_token_ids")
++        if not isinstance(value, list | tuple) or not value:
++            return None
++        if not all(isinstance(token_id, int) and not isinstance(token_id, bool) for token_id in value):
++            return None
++        return [int(token_id) for token_id in value]
++
++    @staticmethod
++    def _qwen3_tts_streaming_input_done(update: StreamingUpdate | None) -> bool:
++        if update is None:
++            return False
++        info = deserialize_additional_information(getattr(update, "additional_information", None))
++        return info.get("qwen3_tts_streaming_input_done") is True
++
++    def add_request(self, request: Request) -> None:
++        """Hot-append Qwen3-TTS text metadata without perturbing Talker KV.
++
++        Upstream streaming sessions queue every update until the current
++        generation segment reaches EOS. That is correct for turn-based LLMs,
++        but defeats Qwen3-TTS dual-track generation: text must be able to arrive
++        while codec decoding is still running. Metadata-only TTS updates are
++        therefore coalesced here and transported with the next cached-request
++        scheduler output. All other streaming requests retain upstream
++        semantics.
++        """
++        existing = self.requests.get(request.request_id)
++        if existing is not None:
++            update = StreamingUpdate.from_request(request)
++            text_delta = self._qwen3_tts_streaming_text_delta(update)
++            text_token_ids = self._qwen3_tts_streaming_text_token_ids(update)
++            input_done = self._qwen3_tts_streaming_input_done(update)
++            if text_delta is not None or text_token_ids is not None or input_done:
++                if text_delta is not None:
++                    self._qwen3_tts_live_text_updates[request.request_id] = (
++                        self._qwen3_tts_live_text_updates.get(request.request_id, "") + text_delta
++                    )
++                if text_token_ids is not None:
++                    live_token_updates = getattr(self, "_qwen3_tts_live_text_token_updates", None)
++                    if live_token_updates is None:
++                        live_token_updates = {}
++                        self._qwen3_tts_live_text_token_updates = live_token_updates
++                    live_token_updates.setdefault(request.request_id, []).extend(text_token_ids)
++                if input_done:
++                    self._qwen3_tts_live_text_done.add(request.request_id)
++                    # The explicit Qwen text-done marker is the session's final
++                    # input. Finalize on the Talker's next natural codec EOS;
++                    # no generic placeholder continuation is required.
++                    existing.resumable = False
++                paused_for_text = getattr(self, "_qwen3_tts_paused_for_text", set())
++                if (
++                    request.request_id in paused_for_text
++                    and existing.async_tokens_to_discard == 0
++                ):
++                    # No stale async frames remain, so the next scheduler tick
++                    # can deliver the queued metadata and continue from the
++                    # same KV cache. A zero gate works for both sync and async
++                    # schedulers regardless of their current step counter.
++                    existing.next_decode_eligible_step = 0
++                    paused_for_text.discard(request.request_id)
++                logger.debug(
++                    "Qwen3-TTS live text queued: req=%s delta_chars=%d queued_chars=%d token_ids=%d "
++                    "queued_token_ids=%d done=%s status=%s",
++                    request.request_id,
++                    len(text_delta or ""),
++                    len(self._qwen3_tts_live_text_updates.get(request.request_id, "")),
++                    len(text_token_ids or []),
++                    len(getattr(self, "_qwen3_tts_live_text_token_updates", {}).get(request.request_id, [])),
++                    input_done,
++                    existing.status,
++                )
++                return
++        super().add_request(request)
+ 
+     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
+         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
+@@ -313,6 +411,61 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
+                 new_list.append(omni_nr)
+ 
+             scheduler_output.scheduled_new_reqs = new_list  # type: ignore[assignment]
++            pending_live_updates: dict[str, dict[str, Any]] = {}
++            cached_req_ids = scheduler_output.scheduled_cached_reqs.req_ids
++            live_text_updates = getattr(self, "_qwen3_tts_live_text_updates", {})
++            live_text_token_updates = getattr(self, "_qwen3_tts_live_text_token_updates", {})
++            live_text_done = getattr(self, "_qwen3_tts_live_text_done", set())
++            for req_id in cached_req_ids:
++                text_delta = live_text_updates.pop(req_id, None)
++                text_token_ids = live_text_token_updates.pop(req_id, None)
++                input_done = req_id in live_text_done
++                live_text_done.discard(req_id)
++                if text_delta or text_token_ids or input_done:
++                    pending_live_updates[req_id] = {}
++                    if text_delta:
++                        pending_live_updates[req_id]["qwen3_tts_streaming_text_delta"] = text_delta
++                    if text_token_ids:
++                        pending_live_updates[req_id]["qwen3_tts_streaming_text_token_ids"] = text_token_ids
++                    if input_done:
++                        pending_live_updates[req_id]["qwen3_tts_streaming_input_done"] = True
++                    logger.debug(
++                        "Qwen3-TTS live text dispatched: req=%s delta_chars=%d token_ids=%d done=%s",
++                        req_id,
++                        len(text_delta or ""),
++                        len(text_token_ids or []),
++                        input_done,
++                    )
++            if pending_live_updates:
++                from .output import OmniCachedRequestData
++
++                cached = scheduler_output.scheduled_cached_reqs
++                all_token_ids = dict(cached.all_token_ids)
++                # A text-starved request is intentionally absent from one or
++                # more persistent runner batches while its KV remains cached.
++                # The async V2 runner needs the complete token list when that
++                # cached request re-enters input_batch, but upstream omits this
++                # payload for V2 requests. Supply it only for live-text resumes
++                # to keep the normal decode path compact.
++                for req_id in pending_live_updates:
++                    request = self.requests.get(req_id)
++                    if request is not None:
++                        all_token_ids[req_id] = request.all_token_ids.copy()
++                scheduler_output.scheduled_cached_reqs = OmniCachedRequestData(
++                    req_ids=cached.req_ids,
++                    resumed_req_ids=cached.resumed_req_ids,
++                    new_token_ids=cached.new_token_ids,
++                    all_token_ids=all_token_ids,
++                    new_block_ids=cached.new_block_ids,
++                    num_computed_tokens=cached.num_computed_tokens,
++                    num_output_tokens=cached.num_output_tokens,
++                    prompt_token_ids={
++                        req_id: list(self.requests[req_id].prompt_token_ids or [])
++                        for req_id in cached.req_ids
++                        if req_id in self.requests
++                    },
++                    additional_information=pending_live_updates,
++                )
+             if self.chunk_transfer_adapter:
+                 self.chunk_transfer_adapter.postprocess_scheduler_output(scheduler_output, self.requests)
+             # Add information about requests needing KV cache transfer
+@@ -472,7 +625,27 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
+             # Check for stop and update request status.
+             if new_token_ids:
+                 num_sampled_tokens = len(new_token_ids)
++                discarding_async_output = request.async_tokens_to_discard > 0
+                 new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
++                if discarding_async_output:
++                    # These runner calls were already in flight when the text
++                    # queue became empty. Drop their audio/intermediate payload
++                    # together with their placeholder token; otherwise a slow
++                    # producer leaks padding as audible garbage.
++                    pooler_output = None
++                    mm_output = None
++                    inter_stage_output = None
++                    if (
++                        request.async_tokens_to_discard == 0
++                        and req_id in getattr(self, "_qwen3_tts_paused_for_text", set())
++                        and (
++                            bool(getattr(self, "_qwen3_tts_live_text_updates", {}).get(req_id))
++                            or bool(getattr(self, "_qwen3_tts_live_text_token_updates", {}).get(req_id))
++                            or req_id in getattr(self, "_qwen3_tts_live_text_done", set())
++                        )
++                    ):
++                        request.next_decode_eligible_step = 0
++                        getattr(self, "_qwen3_tts_paused_for_text", set()).discard(req_id)
+                 if new_logprobs is not None and len(new_token_ids) < num_sampled_tokens:
+                     # A mid-step stop (e.g. spec-decode tokens sampled past
+                     # EOS) trims new_token_ids after the validation slice
+@@ -491,6 +664,48 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
+             if not stopped and self._process_kv_transfer_trigger(request, new_token_ids):
+                 stopped = True
+ 
++            # Qwen3-TTS model-level input streaming uses a normal (non-
++            # resumable) pipeline request plus a metadata side channel. Pause
++            # Talker decoding when its text-conditioning queue is empty while
++            # the producer remains open. The request deliberately remains in
++            # RUNNING: freezing its next eligible decode step preserves KV and
++            # avoids the admission/accounting changes of a WAITING transition.
++            pause_for_live_text = False
++            if not stopped:
++                for live_payload in (mm_output, inter_stage_output, pooler_output):
++                    if not isinstance(live_payload, dict):
++                        continue
++                    meta_out = live_payload.get("meta")
++                    if not isinstance(meta_out, dict):
++                        meta_out = {}
++                    wait_value = meta_out.get("qwen3_tts_waiting_for_text")
++                    if wait_value is None:
++                        wait_value = live_payload.get("meta.qwen3_tts_waiting_for_text")
++                    if hasattr(wait_value, "reshape"):
++                        try:
++                            wait_value = wait_value.reshape(-1)[-1].item()
++                        except Exception:
++                            wait_value = False
++                    if bool(wait_value):
++                        pause_for_live_text = True
++                        break
++            pending_live_text = bool(
++                getattr(self, "_qwen3_tts_live_text_updates", {}).get(req_id)
++            ) or bool(
++                getattr(self, "_qwen3_tts_live_text_token_updates", {}).get(req_id)
++            ) or req_id in getattr(self, "_qwen3_tts_live_text_done", set())
++            paused_for_text = getattr(self, "_qwen3_tts_paused_for_text", set())
++            if pause_for_live_text and not pending_live_text and req_id not in paused_for_text:
++                logger.debug("Qwen3-TTS live text paused: req=%s", request.request_id)
++                paused_for_text.add(req_id)
++                request.next_decode_eligible_step = 1 << 60
++                outstanding_async_tokens = request.num_output_placeholders
++                if outstanding_async_tokens > 0:
++                    request.async_tokens_to_discard = outstanding_async_tokens
++                    request.num_computed_tokens -= outstanding_async_tokens
++                    request.num_output_placeholders = 0
++                request.spec_token_ids = []
++
+             if new_token_ids and self.structured_output_manager.should_advance(request):
+                 struct_output_request = request.structured_output_request
+                 assert struct_output_request is not None
+@@ -823,6 +1038,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
+             self._replace_streaming_session(session, update)
+             return
+         super()._update_request_as_session(session, update)
++        if getattr(update, "additional_information", None) is not None:
++            # A slow producer may deliver the next text chunk after the Talker
++            # has already reached its resumable EOS boundary. Preserve that
++            # delta on the resumed request so the runner can append it during
++            # the continuation prefill.
++            session.additional_information = update.additional_information
+         if hasattr(update, "model_intermediate_buffer"):
+             session.model_intermediate_buffer = update.model_intermediate_buffer
+ 
+@@ -834,6 +1055,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
+         assert request.is_finished()
+ 
+         self._omits_kv_transfer_cache.pop(request.request_id, None)
++        getattr(self, "_qwen3_tts_live_text_updates", {}).pop(request.request_id, None)
++        getattr(self, "_qwen3_tts_live_text_token_updates", {}).pop(request.request_id, None)
++        getattr(self, "_qwen3_tts_live_text_done", set()).discard(request.request_id)
++        getattr(self, "_qwen3_tts_paused_for_text", set()).discard(request.request_id)
+ 
+         # [Upstream compat] Discard request from in-flight prefills set added
+         # upstream for routed-experts in-flight reservation tracking.
+diff --git a/vllm_omni/distributed/omni_connectors/transfer_adapter/chunk_transfer_adapter.py b/vllm_omni/distributed/omni_connectors/transfer_adapter/chunk_transfer_adapter.py
+index d722ada..fa6f757 100644
+--- a/vllm_omni/distributed/omni_connectors/transfer_adapter/chunk_transfer_adapter.py
++++ b/vllm_omni/distributed/omni_connectors/transfer_adapter/chunk_transfer_adapter.py
+@@ -2,7 +2,9 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import importlib
+-from collections import defaultdict, deque
++import threading
++import time
++from collections import Counter, defaultdict, deque
+ from collections.abc import Callable, Mapping
+ from typing import Any
+ 
+@@ -58,6 +60,70 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
+             )
+         self.connector = self.create_connector(model_config)
+         self.receives_chunks = stage_receives_chunks(model_config)
++
++        connector_config = getattr(model_config, "stage_connector_config", None)
++        if isinstance(connector_config, dict):
++            connector_extra = connector_config.get("extra", connector_config)
++        else:
++            connector_extra = getattr(connector_config, "extra", None)
++        connector_extra = connector_extra if isinstance(connector_extra, dict) else {}
++
++        def _config_bool(name: str, default: bool = False) -> bool:
++            value = connector_extra.get(name, default)
++            if isinstance(value, bool):
++                return value
++            if isinstance(value, str):
++                lowered = value.strip().lower()
++                if lowered in {"1", "true", "yes", "on"}:
++                    return True
++                if lowered in {"0", "false", "no", "off"}:
++                    return False
++            if isinstance(value, int):
++                return bool(value)
++            raise ValueError(f"Invalid connector config {name}={value!r}")
++
++        # SLO-aware codec rendezvous is opt-in. It deliberately waits a few
++        # milliseconds for steady-state codec chunks with the same decode
++        # shape to arrive, increasing the effective Code2Wav batch size. First
++        # chunks, terminal chunks, and single-request traffic always bypass it.
++        requested_rendezvous = _config_bool("codec_rendezvous_enabled")
++        self._codec_rendezvous_enabled = bool(
++            requested_rendezvous
++            and self.receives_chunks
++            and (getattr(model_config, "worker_type", None) or "ar") == "generation"
++        )
++        self._codec_rendezvous_target_batch_size = int(connector_extra.get("codec_rendezvous_target_batch_size", 2))
++        self._codec_rendezvous_min_wait_ms = float(connector_extra.get("codec_rendezvous_min_wait_ms", 0.25))
++        self._codec_rendezvous_max_wait_ms = float(connector_extra.get("codec_rendezvous_max_wait_ms", 1.0))
++        self._codec_rendezvous_protect_first_packet = _config_bool(
++            "codec_rendezvous_protect_first_packet", True
++        )
++        self._codec_rendezvous_num_quantizers = int(connector_extra.get("codec_num_quantizers", 16))
++        self._codec_rendezvous_stats_log_every = int(connector_extra.get("codec_rendezvous_stats_log_every", 100))
++        if self._codec_rendezvous_target_batch_size < 2:
++            raise ValueError("codec_rendezvous_target_batch_size must be >= 2")
++        if self._codec_rendezvous_min_wait_ms < 0:
++            raise ValueError("codec_rendezvous_min_wait_ms must be >= 0")
++        if self._codec_rendezvous_max_wait_ms < self._codec_rendezvous_min_wait_ms:
++            raise ValueError("codec_rendezvous_max_wait_ms must be >= codec_rendezvous_min_wait_ms")
++        if self._codec_rendezvous_num_quantizers <= 0:
++            raise ValueError("codec_num_quantizers must be > 0")
++        if self._codec_rendezvous_stats_log_every < 0:
++            raise ValueError("codec_rendezvous_stats_log_every must be >= 0")
++        self._codec_rendezvous_stats: Counter[str] = Counter()
++        self._codec_rendezvous_batch_hist: Counter[int] = Counter()
++        self._codec_rendezvous_next_log = self._codec_rendezvous_stats_log_every
++        self._codec_rendezvous_cond = threading.Condition()
++        self._codec_rendezvous_arrival_epoch = 0
++        if self._codec_rendezvous_enabled:
++            logger.info(
++                "SLO-aware codec rendezvous enabled: target_batch=%d wait_ms=[%.2f, %.2f] "
++                "event_driven=true protect_first_packet=%s",
++                self._codec_rendezvous_target_batch_size,
++                self._codec_rendezvous_min_wait_ms,
++                self._codec_rendezvous_max_wait_ms,
++                self._codec_rendezvous_protect_first_packet,
++            )
+         super().__init__(model_config)
+         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
+         # State specific to Chunk management
+@@ -116,6 +182,259 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
+         if getattr(request, "prefill_stats", None) is None:
+             request.prefill_stats = PrefillStats()
+ 
++    @staticmethod
++    def _rendezvous_meta_int(value: Any) -> int:
++        if isinstance(value, list):
++            value = value[0] if value else 0
++        if isinstance(value, torch.Tensor):
++            value = value.reshape(-1)[0].item() if value.numel() else 0
++        try:
++            return int(value or 0)
++        except (TypeError, ValueError):
++            return 0
++
++    @staticmethod
++    def _rendezvous_meta_bool(value: Any) -> bool:
++        if isinstance(value, list):
++            value = value[0] if value else False
++        if isinstance(value, torch.Tensor):
++            return bool(value.reshape(-1)[0].item()) if value.numel() else False
++        return bool(value)
++
++    def _codec_rendezvous_bucket(self, request: Request) -> int | None:
++        """Return the effective Code2Wav frame shape for one staged chunk."""
++        info = getattr(request, "additional_information", None)
++        if not isinstance(info, dict):
++            return None
++        codes = info.get("codes")
++        audio = codes.get("audio") if isinstance(codes, dict) else None
++        if isinstance(audio, torch.Tensor):
++            num_tokens = int(audio.numel())
++        elif isinstance(audio, (list, tuple)):
++            if audio and isinstance(audio[0], (list, tuple)):
++                num_tokens = sum(len(row) for row in audio)
++            else:
++                num_tokens = len(audio)
++        else:
++            # Generation-mode async chunks commonly travel as flat prompt ids;
++            # additional_information then carries only metadata. Tensor payloads
++            # use a one-token placeholder and remain available above in codes.audio.
++            prompt_token_ids = getattr(request, "prompt_token_ids", None)
++            if not isinstance(prompt_token_ids, (list, tuple)):
++                return None
++            num_tokens = len(prompt_token_ids)
++        if num_tokens <= 0 or num_tokens % self._codec_rendezvous_num_quantizers != 0:
++            return None
++
++        frames = num_tokens // self._codec_rendezvous_num_quantizers
++        meta = info.get("meta")
++        if isinstance(meta, dict):
++            ref_frames = self._rendezvous_meta_int(meta.get("ref_context_size"))
++            ref_included = self._rendezvous_meta_bool(meta.get("ref_context_included"))
++            if ref_frames > 0 and not ref_included:
++                frames += ref_frames
++        return frames
++
++    def _codec_rendezvous_effective_wait_ms(self, active_requests: int) -> float:
++        if self._codec_rendezvous_max_wait_ms <= self._codec_rendezvous_min_wait_ms:
++            return self._codec_rendezvous_min_wait_ms
++        load = min(1.0, max(0.0, (active_requests - 1) / (self._codec_rendezvous_target_batch_size - 1)))
++        return self._codec_rendezvous_min_wait_ms + (
++            self._codec_rendezvous_max_wait_ms - self._codec_rendezvous_min_wait_ms
++        ) * load
++
++    def _classify_codec_rendezvous_ready(
++        self,
++        ready_ids: set[str],
++        scheduler_requests: dict[str, Request],
++    ) -> tuple[set[str], dict[int, set[str]]]:
++        bypass: set[str] = set()
++        buckets: dict[int, set[str]] = defaultdict(set)
++        for req_id in ready_ids:
++            request = scheduler_requests.get(req_id)
++            chunk_number = int(self.get_req_chunk.get(req_id, 0))
++            if request is None or chunk_number <= 1 or self.is_done_receiving_chunks(req_id):
++                bypass.add(req_id)
++                continue
++            bucket = self._codec_rendezvous_bucket(request)
++            if bucket is None:
++                bypass.add(req_id)
++            else:
++                buckets[bucket].add(req_id)
++        return bypass, buckets
++
++    def _record_codec_rendezvous_release(
++        self,
++        *,
++        cause: str,
++        initial_ready: int,
++        released_ids: set[str],
++        waited_ms: float,
++        scheduler_requests: dict[str, Request],
++    ) -> None:
++        stats = self._codec_rendezvous_stats
++        stats["cycles"] += 1
++        stats[f"cause_{cause}"] += 1
++        stats["ready_initial"] += initial_ready
++        stats["released_chunks"] += len(released_ids)
++        stats["wait_us"] += int(round(waited_ms * 1000.0))
++        stats["max_wait_us"] = max(stats["max_wait_us"], int(round(waited_ms * 1000.0)))
++
++        grouped: Counter[int] = Counter()
++        for req_id in released_ids:
++            request = scheduler_requests.get(req_id)
++            bucket = self._codec_rendezvous_bucket(request) if request is not None else None
++            if bucket is not None:
++                grouped[bucket] += 1
++        for group_size in grouped.values():
++            self._codec_rendezvous_batch_hist[group_size] += 1
++
++        every = self._codec_rendezvous_stats_log_every
++        if every <= 0 or stats["released_chunks"] < self._codec_rendezvous_next_log:
++            return
++        cycles = max(1, stats["cycles"])
++        logger.info(
++            "Codec rendezvous stats: cycles=%d released=%d avg_ready=%.2f avg_wait_ms=%.3f "
++            "max_wait_ms=%.3f target_hits=%d deadline_hits=%d bypass_hits=%d slo_bypass_hits=%d batch_hist=%s",
++            cycles,
++            stats["released_chunks"],
++            stats["ready_initial"] / cycles,
++            stats["wait_us"] / cycles / 1000.0,
++            stats["max_wait_us"] / 1000.0,
++            stats["cause_target"],
++            stats["cause_deadline"],
++            stats["cause_bypass"],
++            stats["cause_slo_bypass"],
++            sorted(self._codec_rendezvous_batch_hist.items()),
++        )
++        while self._codec_rendezvous_next_log <= stats["released_chunks"]:
++            self._codec_rendezvous_next_log += every
++
++    def _select_codec_rendezvous_ready(
++        self,
++        scheduler_requests: dict[str, Request] | None,
++    ) -> set[str]:
++        """Select ready chunks, briefly coalescing shape-compatible steady chunks.
++
++        The wait is intentionally performed inside the scheduling call. The
++        connector receive thread continues polling during this bounded sleep,
++        while an idle engine is not guaranteed to issue a future scheduler tick
++        solely for a rendezvous deadline.
++        """
++        ready_ids = self._finished_load_reqs.copy()
++        if not self._codec_rendezvous_enabled or not ready_ids or scheduler_requests is None:
++            return ready_ids
++        ready_ids.intersection_update(scheduler_requests)
++        if not ready_ids:
++            return set()
++
++        active_requests = len(scheduler_requests)
++        initial_ready = len(ready_ids)
++        if active_requests <= 1:
++            self._record_codec_rendezvous_release(
++                cause="single",
++                initial_ready=initial_ready,
++                released_ids=ready_ids,
++                waited_ms=0.0,
++                scheduler_requests=scheduler_requests,
++            )
++            return ready_ids
++
++        # Protect time-to-first-packet under admission churn. A bounded codec
++        # wait is only permitted after every live request has received its
++        # first upstream chunk; otherwise a steady-state decode can occupy the
++        # scheduler while a newly admitted request is approaching first audio.
++        if self._codec_rendezvous_protect_first_packet and any(
++            req_id not in ready_ids and int(self.get_req_chunk.get(req_id, 0)) <= 1 for req_id in scheduler_requests
++        ):
++            self._record_codec_rendezvous_release(
++                cause="slo_bypass",
++                initial_ready=initial_ready,
++                released_ids=ready_ids,
++                waited_ms=0.0,
++                scheduler_requests=scheduler_requests,
++            )
++            return ready_ids
++
++        bypass, buckets = self._classify_codec_rendezvous_ready(ready_ids, scheduler_requests)
++        full_bucket_ids = set().union(
++            *(
++                group
++                for group in buckets.values()
++                if len(group) >= self._codec_rendezvous_target_batch_size
++            ),
++            set(),
++        )
++        if bypass or full_bucket_ids:
++            released_ids = bypass | full_bucket_ids
++            self._record_codec_rendezvous_release(
++                cause="target" if full_bucket_ids else "bypass",
++                initial_ready=initial_ready,
++                released_ids=released_ids,
++                waited_ms=0.0,
++                scheduler_requests=scheduler_requests,
++            )
++            # Latency-sensitive first/terminal chunks bypass immediately,
++            # while undersized steady-state shape buckets stay parked for a
++            # later scheduler tick. Likewise, a full bucket must not drag an
++            # incompatible partial bucket through Code2Wav prematurely.
++            return released_ids
++
++        wait_ms = self._codec_rendezvous_effective_wait_ms(active_requests)
++        if wait_ms <= 0:
++            self._record_codec_rendezvous_release(
++                cause="deadline",
++                initial_ready=initial_ready,
++                released_ids=ready_ids,
++                waited_ms=0.0,
++                scheduler_requests=scheduler_requests,
++            )
++            return ready_ids
++
++        started = time.monotonic()
++        deadline = started + wait_ms / 1000.0
++        cause = "deadline"
++        while True:
++            with self._codec_rendezvous_cond:
++                observed_epoch = self._codec_rendezvous_arrival_epoch
++            refreshed = self._finished_load_reqs.copy()
++            refreshed.intersection_update(scheduler_requests)
++            if refreshed:
++                ready_ids = refreshed
++                bypass, buckets = self._classify_codec_rendezvous_ready(ready_ids, scheduler_requests)
++                full_bucket_ids = set().union(
++                    *(
++                        group
++                        for group in buckets.values()
++                        if len(group) >= self._codec_rendezvous_target_batch_size
++                    ),
++                    set(),
++                )
++                if bypass or full_bucket_ids:
++                    ready_ids = bypass | full_bucket_ids
++                    cause = "target" if full_bucket_ids else "bypass"
++                    break
++
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                break
++            # Sleep until the receive thread publishes a new chunk, avoiding
++            # fixed-interval polling and waking immediately on a potential peer.
++            # The epoch closes the notify-before-wait race.
++            with self._codec_rendezvous_cond:
++                if self._codec_rendezvous_arrival_epoch == observed_epoch:
++                    self._codec_rendezvous_cond.wait(timeout=remaining)
++
++        elapsed_ms = (time.monotonic() - started) * 1000.0
++        self._record_codec_rendezvous_release(
++            cause=cause,
++            initial_ready=initial_ready,
++            released_ids=ready_ids,
++            waited_ms=elapsed_ms,
++            scheduler_requests=scheduler_requests,
++        )
++        return ready_ids
++
+     @classmethod
+     def create_connector(cls, model_config: Any):
+         connector_config = getattr(model_config, "stage_connector_config", None)
+@@ -306,7 +625,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
+                 self._refresh_generation_chunk_prefill_state(request)
+ 
+             # Mark as finished for consumption
+-            self._finished_load_reqs.add(req_id)
++            with self._codec_rendezvous_cond:
++                self._finished_load_reqs.add(req_id)
++                self._codec_rendezvous_arrival_epoch += 1
++                self._codec_rendezvous_cond.notify_all()
+             logger.debug(f"[Stage-{stage_id}] Received one chunk for key {connector_get_key}")
+             return True
+ 
+@@ -528,16 +850,20 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
+             self._purge_untracked_chunk_requests(self.waiting_for_chunk_waiting_requests, scheduler_requests)
+             self._purge_untracked_chunk_requests(self.waiting_for_chunk_running_requests, scheduler_requests)
+ 
++        selected_ready = self._select_codec_rendezvous_ready(scheduler_requests)
++        selected_ready_before = selected_ready.copy()
++
+         if self._active_window <= 0:
+             self._process_chunk_queue_legacy(
+-                waiting_queue, self.waiting_for_chunk_waiting_requests, RequestStatus.WAITING, self._finished_load_reqs
++                waiting_queue, self.waiting_for_chunk_waiting_requests, RequestStatus.WAITING, selected_ready
+             )
+             self._process_chunk_queue_legacy(
+                 running_queue,
+                 self.waiting_for_chunk_running_requests,
+                 RequestStatus.RUNNING,
+-                self._finished_load_reqs,
++                selected_ready,
+             )
++            self._finished_load_reqs.difference_update(selected_ready_before - selected_ready)
+             while len(running_queue) > self.scheduler_max_num_seqs:
+                 request = running_queue.pop()
+                 request.status = RequestStatus.PREEMPTED
+@@ -547,11 +873,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
+         self._promote_active_streams(running_queue)
+         self._promote_active_streams(waiting_queue)
+         self._process_chunk_queue(
+-            waiting_queue, self.waiting_for_chunk_waiting_requests, RequestStatus.WAITING, self._finished_load_reqs
++            waiting_queue, self.waiting_for_chunk_waiting_requests, RequestStatus.WAITING, selected_ready
+         )
+         self._process_chunk_queue(
+-            running_queue, self.waiting_for_chunk_running_requests, RequestStatus.RUNNING, self._finished_load_reqs
++            running_queue, self.waiting_for_chunk_running_requests, RequestStatus.RUNNING, selected_ready
+         )
++        self._finished_load_reqs.difference_update(selected_ready_before - selected_ready)
+         self._promote_active_streams(waiting_queue)
+         self._preempt_non_active_running(waiting_queue, running_queue)
+ 
+diff --git a/vllm_omni/engine/orchestrator.py b/vllm_omni/engine/orchestrator.py
+index 0b4f17a..6666a3f 100644
+--- a/vllm_omni/engine/orchestrator.py
++++ b/vllm_omni/engine/orchestrator.py
+@@ -49,7 +49,7 @@ from vllm_omni.engine.messages import (
+     UnregisterRemoteReplicaMessage,
+ )
+ from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
+-from vllm_omni.engine.serialization import serialize_additional_information
++from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
+ from vllm_omni.engine.stage_pool import StagePool
+ from vllm_omni.metrics.prometheus import OmniRequestCounter
+ from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
+@@ -715,7 +715,10 @@ class Orchestrator:
+         if msg.sampling_params_list:
+             req_state.sampling_params_list = msg.sampling_params_list
+ 
+-        req_state.streaming.enabled = True
++        update_info = deserialize_additional_information(getattr(request, "additional_information", None))
++        is_qwen3_tts_live_update = update_info.get("qwen3_tts_model_live_session") is True
++        if not is_qwen3_tts_live_update:
++            req_state.streaming.enabled = True
+         req_state.stage_submit_ts[stage_id] = _time.time()
+         await self.stage_pools[stage_id].submit_update(
+             request_id,
+@@ -724,7 +727,7 @@ class Orchestrator:
+             prompt_text=msg.output_prompt_text,
+         )
+ 
+-        if self.async_chunk and stage_id == 0 and final_stage_id > 0:
++        if self.async_chunk and stage_id == 0 and final_stage_id > 0 and not is_qwen3_tts_live_update:
+             await self._prewarm_async_chunk_stages(request_id, request, req_state)
+ 
+     async def _handle_add_companion(self, msg: AddCompanionRequestMessage) -> None:
+diff --git a/vllm_omni/engine/stage_pool.py b/vllm_omni/engine/stage_pool.py
+index 354032a..60eccc1 100644
+--- a/vllm_omni/engine/stage_pool.py
++++ b/vllm_omni/engine/stage_pool.py
+@@ -1020,19 +1020,26 @@ class StagePool:
+                 )
+             await self._diffusion_client(replica_id).add_request_async(request_id, request, params)
+         else:
++            from vllm_omni.engine.serialization import deserialize_additional_information
++
++            update_info = deserialize_additional_information(getattr(request, "additional_information", None))
++            is_qwen3_tts_live_update = update_info.get("qwen3_tts_model_live_session") is True
+             # Refresh the shared output-processor state before yielding to the
+             # stage client so streaming segments are merged against the latest
+             # prompt/token metadata.
+             try:
+-                self.output_processor.add_request(
+-                    request=request,
+-                    prompt=prompt_text,
+-                    parent_req=None,
+-                    request_index=0,
+-                    queue=None,
+-                )
++                if not is_qwen3_tts_live_update:
++                    self.output_processor.add_request(
++                        request=request,
++                        prompt=prompt_text,
++                        parent_req=None,
++                        request_index=0,
++                        queue=None,
++                    )
+                 await self._llm_client(replica_id).add_request_async(request)
+             except Exception:
++                if is_qwen3_tts_live_update:
++                    raise
+                 rollback = getattr(self.output_processor, "remove_request", None)
+                 if callable(rollback):
+                     try:
+diff --git a/vllm_omni/entrypoints/async_omni.py b/vllm_omni/entrypoints/async_omni.py
+index 1437cc6..84a1778 100644
+--- a/vllm_omni/entrypoints/async_omni.py
++++ b/vllm_omni/entrypoints/async_omni.py
+@@ -688,6 +688,12 @@ class AsyncOmni(EngineClient, OmniBase):
+                     prompt_text, _, _ = extract_prompt_components(self.model_config, chunk_prompt)
+ 
+                     if not has_submitted_first_chunk:
++                        raw_info = chunk_prompt.get("additional_information") if isinstance(chunk_prompt, dict) else None
++                        live_session_raw = (
++                            raw_info.get("qwen3_tts_model_live_session") if isinstance(raw_info, dict) else False
++                        )
++                        if isinstance(live_session_raw, list):
++                            live_session_raw = live_session_raw[0] if live_session_raw else False
+                         await self.engine.add_request_async(
+                             request_id=request_id,
+                             prompt=chunk_prompt,
+@@ -696,7 +702,11 @@ class AsyncOmni(EngineClient, OmniBase):
+                             final_stage_id=final_stage_id,
+                             final_output_stage_ids=final_output_stage_ids,
+                             arrival_time=arrival_time,
+-                            resumable=True,
++                            # Qwen3-TTS live text uses metadata-only hot
++                            # updates against one ordinary pipeline request.
++                            # Keeping the model request non-resumable avoids
++                            # turn-boundary semantics in downstream audio.
++                            resumable=live_session_raw is not True,
+                         )
+                         has_submitted_first_chunk = True
+                     else:
+diff --git a/vllm_omni/entrypoints/openai/protocol/audio.py b/vllm_omni/entrypoints/openai/protocol/audio.py
+index 92b2efd..602863d 100644
+--- a/vllm_omni/entrypoints/openai/protocol/audio.py
++++ b/vllm_omni/entrypoints/openai/protocol/audio.py
+@@ -520,6 +520,14 @@ class StreamingSpeechSessionConfig(BaseModel):
+             "When null, use model defaults: Base=False, CustomVoice/VoiceDesign=True."
+         ),
+     )
++    model_streaming_input: bool = Field(
++        default=False,
++        description=(
++            "Keep one Qwen3-TTS Talker request alive while input.text messages "
++            "append text conditioning to its existing KV-cache. Audio can be "
++            "returned before input.done. Requires stream_audio=true and PCM."
++        ),
++    )
+     ref_audio: str | None = None
+     ref_text: str | None = None
+     x_vector_only_mode: bool | None = None
+@@ -557,4 +565,19 @@ class StreamingSpeechSessionConfig(BaseModel):
+                 self.speed = 1.0
+             elif self.speed != 1.0:
+                 raise ValueError("Speed adjustment is not supported when stream_audio=true. Set speed=1.0 or omit it.")
++        if self.model_streaming_input:
++            if not self.stream_audio or self.response_format != "pcm":
++                raise ValueError(
++                    "model_streaming_input=true requires stream_audio=true and response_format='pcm'."
++                )
++            if self.word_timestamps:
++                raise ValueError(
++                    "word_timestamps is not supported with model_streaming_input because the final text is "
++                    "not available when audio starts."
++                )
++            if self.non_streaming_mode is True:
++                raise ValueError(
++                    "model_streaming_input=true requires Qwen3-TTS non_streaming_mode=false."
++                )
++            self.non_streaming_mode = False
+         return self
+diff --git a/vllm_omni/entrypoints/openai/serving_speech.py b/vllm_omni/entrypoints/openai/serving_speech.py
+index 6cec05d..b6b4c75 100644
+--- a/vllm_omni/entrypoints/openai/serving_speech.py
++++ b/vllm_omni/entrypoints/openai/serving_speech.py
+@@ -9,7 +9,7 @@ import re
+ import struct
+ import time
+ from collections import OrderedDict
+-from collections.abc import Mapping
++from collections.abc import AsyncIterator, Mapping
+ from concurrent.futures import ThreadPoolExecutor
+ from http import HTTPStatus
+ from pathlib import Path
+@@ -21,6 +21,7 @@ import torch
+ from fastapi import HTTPException, Request, UploadFile
+ from fastapi.responses import Response, StreamingResponse
+ from transformers.utils.hub import cached_file
++from vllm.engine.protocol import StreamingInput
+ from vllm.entrypoints.generate.base.serving import GenerateBaseServing as OpenAIServing
+ from vllm.entrypoints.launcher import terminate_if_errored
+ from vllm.entrypoints.openai.engine.protocol import (
+@@ -3213,6 +3214,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
+         request: OpenAICreateSpeechRequest,
+         request_id: str | None = None,
+         has_inline_ref_audio: bool | None = None,
++        streaming_text_input: AsyncIterator[str | list[int]] | None = None,
++        streaming_initial_text_token_ids: list[int] | None = None,
+     ) -> tuple[str, Any, dict[str, Any]]:
+         if self.engine_client.errored:
+             raise self.engine_client.dead_error
+@@ -3300,6 +3303,25 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
+             model_type,
+         )
+ 
++        if streaming_initial_text_token_ids is not None:
++            if self._tts_model_type != "qwen3_tts":
++                raise ValueError("pretokenized streaming text is supported only for Qwen3-TTS")
++            if not streaming_initial_text_token_ids or not all(
++                isinstance(token_id, int) and not isinstance(token_id, bool)
++                for token_id in streaming_initial_text_token_ids
++            ):
++                raise ValueError("streaming_initial_text_token_ids must be a non-empty list of integers")
++            from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
++                PRECOMPUTED_TEXT_IDS_KEY,
++            )
++
++            # Keep the adapter-built voice/language prefix, but make the text
++            # conditioning use the exact token plan supplied by the WebSocket
++            # session. The nested list preserves the one-request batch shape
++            # expected by ``coerce_token_ids`` in the Talker worker.
++            tts_params[PRECOMPUTED_TEXT_IDS_KEY] = [list(streaming_initial_text_token_ids)]
++            prompt["additional_information"] = tts_params
++
+         # CosyVoice3: set dynamic min/max tokens based on text length.
+         # The official model requires min_token_text_ratio to prevent early
+         # EOS and max_token_text_ratio to cap generation length.
+@@ -3444,8 +3466,61 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
+                     stage0_params.extra_args = {}
+                 stage0_params.extra_args.setdefault("tts_local_seed", int(default_seed))
+ 
++        engine_prompt = prompt
++        if streaming_text_input is not None:
++            if self._tts_model_type != "qwen3_tts":
++                raise ValueError("model-level streaming text input is currently supported only for Qwen3-TTS")
++            if request.non_streaming_mode is not False:
++                raise ValueError("model-level streaming text input requires non_streaming_mode=false")
++
++            # The first item carries the complete Qwen3-TTS voice/language
++            # prefix. Later items are metadata-only text deltas. Stage 0
++            # recognizes these deltas and appends their projected text
++            # conditioning to the live Talker request without rebuilding its
++            # prefix or discarding the KV cache.
++            tts_params["model_streaming_input"] = [True]
++            tts_params["qwen3_tts_streaming_input_open"] = [True]
++            tts_params["qwen3_tts_model_live_session"] = [True]
++
++            async def qwen3_tts_prompt_stream():
++                yield StreamingInput(prompt=prompt)
++                async for text_update in streaming_text_input:
++                    additional_information: dict[str, Any] = {
++                        "qwen3_tts_model_live_session": True,
++                    }
++                    if isinstance(text_update, str) and text_update:
++                        additional_information["qwen3_tts_streaming_text_delta"] = text_update
++                    elif isinstance(text_update, list) and text_update and all(
++                        isinstance(token_id, int) and not isinstance(token_id, bool)
++                        for token_id in text_update
++                    ):
++                        additional_information["qwen3_tts_streaming_text_token_ids"] = list(text_update)
++                    else:
++                        continue
++                    delta_prompt = tokens_input(prompt_token_ids=[0])
++                    delta_prompt["additional_information"] = additional_information
++                    yield StreamingInput(prompt=delta_prompt)
++                # Text EOS is deliberately withheld while the producer is
++                # open. This explicit marker appends it only after input.done,
++                # preventing a short early fragment from ending the Talker
++                # before later characters arrive.
++                done_prompt = tokens_input(prompt_token_ids=[0])
++                done_prompt["additional_information"] = {
++                    "qwen3_tts_streaming_input_done": True,
++                    "qwen3_tts_model_live_session": True,
++                }
++                yield StreamingInput(prompt=done_prompt)
++                # The scheduler turns the live request non-resumable when it
++                # consumes the done marker. Keep this producer open until the
++                # resulting terminal model output completes; otherwise the
++                # generic streaming-input layer would append a second, empty
++                # final segment and race the multi-stage TTS shutdown.
++                await asyncio.Event().wait()
++
++            engine_prompt = qwen3_tts_prompt_stream()
++
+         generator = self.engine_client.generate(
+-            prompt=prompt,
++            prompt=engine_prompt,
+             request_id=request_id,
+             sampling_params_list=sampling_params_list,
+             output_modalities=["audio"],
+diff --git a/vllm_omni/entrypoints/openai/serving_speech_stream.py b/vllm_omni/entrypoints/openai/serving_speech_stream.py
+index 102cfda..2e13e5d 100644
+--- a/vllm_omni/entrypoints/openai/serving_speech_stream.py
++++ b/vllm_omni/entrypoints/openai/serving_speech_stream.py
+@@ -1,7 +1,9 @@
+ """WebSocket handler for streaming text input TTS.
+ 
+-Accepts text incrementally via WebSocket, buffers it until input.done, and
+-generates audio once for the buffered input using the existing TTS pipeline.
++Accepts text incrementally via WebSocket. In compatibility mode it buffers
++until input.done. With ``model_streaming_input=true`` it starts one Qwen3-TTS
++Talker request on the first fragment, appends later text conditioning to that
++live request, and can return audio before input.done.
+ 
+ input.done is a flush, not a close: it ends the current utterance and the
+ connection stays open, so the next utterance reuses the same connection
+@@ -17,6 +19,8 @@ several paragraphs, synthesized as a single request.
+ Protocol:
+     Client -> Server:
+         {"type": "session.config", ...}   # Session config (first message; repeatable)
++        {"type": "input.plan", "text": "..."} # Tokenize one utterance once (native mode)
++        {"type": "input.tokens", "token_ids": [...]} # Exact token batches from input.plan.ready
+         {"type": "input.text", "text": "..."} # Text chunks
+         {"type": "input.done"}            # End of utterance, flush and keep connection open
+         {"type": "session.close"}         # End of connection
+@@ -50,7 +54,7 @@ Protocol:
+ import asyncio
+ import base64
+ import json
+-from contextlib import aclosing
++from contextlib import aclosing, suppress
+ 
+ from fastapi import WebSocket, WebSocketDisconnect
+ from pydantic import ValidationError
+@@ -61,6 +65,7 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
+     StreamingSpeechSessionConfig,
+ )
+ from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
++from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import build_assistant_text
+ from vllm_omni.utils.forced_aligner import ForcedAlignerLoadError
+ from vllm_omni.utils.forced_aligner import align as forced_align
+ 
+@@ -68,20 +73,20 @@ logger = init_logger(__name__)
+ 
+ _DEFAULT_IDLE_TIMEOUT = 30.0  # seconds
+ _DEFAULT_CONFIG_TIMEOUT = 10.0  # seconds
++_DEFAULT_MODEL_STREAMING_FINALIZE_TIMEOUT = 30.0  # seconds after input.done
+ _PCM_SAMPLE_RATE = 24000
+ _BYTES_PER_SAMPLE = 2  # 16-bit mono PCM
+ _MAX_CONFIG_MESSAGE_SIZE = 4 * 1024 * 1024  # allow large ref_audio payloads
+ _MAX_INPUT_TEXT_MESSAGE_SIZE = 128 * 1024
++_MAX_STREAMING_TOKEN_BATCH_SIZE = 64
+ 
+ 
+ class OmniStreamingSpeechHandler:
+     """Handles WebSocket sessions for streaming text-input TTS.
+ 
+-    A connection carries one or more utterances. Text arrives incrementally,
+-    is buffered until input.done, and audio is generated once for the
+-    buffered input using the existing OmniOpenAIServingSpeech pipeline. The
+-    connection outlives each utterance so a client can keep synthesizing on
+-    it without reconnecting.
++    A connection carries one or more utterances. Compatibility sessions buffer
++    text until input.done. Native Qwen3-TTS sessions run input receive and audio
++    generation concurrently so input.done only closes the model input stream.
+ 
+     Args:
+         speech_service: The existing TTS serving instance (reused for
+@@ -95,10 +100,12 @@ class OmniStreamingSpeechHandler:
+         speech_service: OmniOpenAIServingSpeech,
+         idle_timeout: float = _DEFAULT_IDLE_TIMEOUT,
+         config_timeout: float = _DEFAULT_CONFIG_TIMEOUT,
++        model_streaming_finalize_timeout: float = _DEFAULT_MODEL_STREAMING_FINALIZE_TIMEOUT,
+     ) -> None:
+         self._speech_service = speech_service
+         self._idle_timeout = idle_timeout
+         self._config_timeout = config_timeout
++        self._model_streaming_finalize_timeout = model_streaming_finalize_timeout
+ 
+     async def handle_session(self, websocket: WebSocket) -> None:
+         """Main loop for a single WebSocket connection.
+@@ -114,6 +121,33 @@ class OmniStreamingSpeechHandler:
+         config: StreamingSpeechSessionConfig | None = None
+         text_parts: list[str] = []
+         utterance_index = 0
++        model_input_queue: asyncio.Queue[str | list[int] | None] | None = None
++        generation_task: asyncio.Task | None = None
++        planned_text: str | None = None
++        planned_token_ids: list[int] = []
++        planned_token_pieces: list[str] = []
++        planned_header_ids: list[int] = []
++        planned_footer_ids: list[int] = []
++        planned_token_cursor = 0
++
++        async def cancel_generation() -> None:
++            nonlocal model_input_queue, generation_task
++            if model_input_queue is not None:
++                with suppress(asyncio.QueueFull):
++                    model_input_queue.put_nowait(None)
++            if generation_task is not None and not generation_task.done():
++                generation_task.cancel()
++                with suppress(asyncio.CancelledError, Exception):
++                    await generation_task
++            model_input_queue = None
++            generation_task = None
++
++        async def iter_model_text_updates(queue: asyncio.Queue[str | list[int] | None]):
++            while True:
++                item = await queue.get()
++                if item is None:
++                    return
++                yield item
+ 
+         try:
+             while True:
+@@ -127,6 +161,7 @@ class OmniStreamingSpeechHandler:
+                         await self._send_error(websocket, "Timeout waiting for session.config")
+                     else:
+                         await self._send_error(websocket, "Idle timeout: no message received")
++                    await cancel_generation()
+                     return
+ 
+                 msg = await self._parse_message(websocket, raw)
+@@ -138,7 +173,7 @@ class OmniStreamingSpeechHandler:
+                 msg_type = msg.get("type")
+ 
+                 if msg_type == "session.config":
+-                    if text_parts:
++                    if text_parts or (generation_task is not None and not generation_task.done()):
+                         await self._send_error(
+                             websocket,
+                             "session.config cannot be applied while input is buffered; send input.done first",
+@@ -159,17 +194,147 @@ class OmniStreamingSpeechHandler:
+                     return
+ 
+                 elif msg_type == "input.text":
++                    if planned_text is not None:
++                        await self._send_error(
++                            websocket,
++                            "input.text cannot be mixed with an active input.plan; send input.tokens instead",
++                        )
++                        continue
+                     text = msg.get("text", "")
+                     if not isinstance(text, str):
+                         await self._send_error(websocket, "input.text requires a string value")
+                         continue
++                    if not text:
++                        continue
++                    text_parts.append(text)
++                    if config.model_streaming_input:
++                        if generation_task is None:
++                            model_input_queue = asyncio.Queue(maxsize=256)
++                            generation_task = asyncio.create_task(
++                                self._generate_and_send(
++                                    websocket,
++                                    config,
++                                    text,
++                                    utterance_index=utterance_index,
++                                    sentence_index=0,
++                                    streaming_text_input=iter_model_text_updates(model_input_queue),
++                                )
++                            )
++                        else:
++                            assert model_input_queue is not None
++                            await model_input_queue.put(text)
++
++                elif msg_type == "input.plan":
++                    if not config.model_streaming_input:
++                        await self._send_error(websocket, "input.plan requires model_streaming_input=true")
++                        continue
++                    if text_parts or generation_task is not None or planned_text is not None:
++                        await self._send_error(websocket, "an utterance is already active; send input.done first")
++                        continue
++                    text = msg.get("text", "")
++                    if not isinstance(text, str) or not text.strip():
++                        await self._send_error(websocket, "input.plan requires non-empty text")
++                        continue
++                    try:
++                        (
++                            planned_token_ids,
++                            planned_token_pieces,
++                            planned_header_ids,
++                            planned_footer_ids,
++                        ) = self._tokenize_qwen3_tts_plan(text)
++                    except Exception as exc:
++                        await self._send_error(websocket, f"failed to tokenize input.plan: {exc}")
++                        continue
++                    planned_text = text
++                    planned_token_cursor = 0
+                     text_parts.append(text)
++                    await websocket.send_json(
++                        {
++                            "type": "input.plan.ready",
++                            "token_ids": planned_token_ids,
++                            "tokens": planned_token_pieces,
++                            "token_count": len(planned_token_ids),
++                        }
++                    )
++
++                elif msg_type == "input.tokens":
++                    if planned_text is None:
++                        await self._send_error(websocket, "input.tokens requires input.plan first")
++                        continue
++                    token_ids_raw = msg.get("token_ids")
++                    if not isinstance(token_ids_raw, list) or not token_ids_raw:
++                        await self._send_error(websocket, "input.tokens requires a non-empty token_ids list")
++                        continue
++                    if len(token_ids_raw) > _MAX_STREAMING_TOKEN_BATCH_SIZE:
++                        await self._send_error(
++                            websocket,
++                            f"input.tokens batch exceeds {_MAX_STREAMING_TOKEN_BATCH_SIZE} tokens",
++                        )
++                        continue
++                    if not all(
++                        isinstance(token_id, int) and not isinstance(token_id, bool) for token_id in token_ids_raw
++                    ):
++                        await self._send_error(websocket, "input.tokens token_ids must contain only integers")
++                        continue
++                    token_ids = [int(token_id) for token_id in token_ids_raw]
++                    expected = planned_token_ids[
++                        planned_token_cursor : planned_token_cursor + len(token_ids)
++                    ]
++                    if token_ids != expected:
++                        await self._send_error(
++                            websocket,
++                            "input.tokens does not match the next token range returned by input.plan.ready",
++                        )
++                        continue
++                    planned_token_cursor += len(token_ids)
++                    if generation_task is None:
++                        model_input_queue = asyncio.Queue(maxsize=256)
++                        initial_assistant_ids = planned_header_ids + token_ids + planned_footer_ids
++                        generation_task = asyncio.create_task(
++                            self._generate_and_send(
++                                websocket,
++                                config,
++                                planned_text,
++                                utterance_index=utterance_index,
++                                sentence_index=0,
++                                streaming_text_input=iter_model_text_updates(model_input_queue),
++                                streaming_initial_text_token_ids=initial_assistant_ids,
++                            )
++                        )
++                    else:
++                        assert model_input_queue is not None
++                        await model_input_queue.put(token_ids)
+ 
+                 elif msg_type == "input.done":
+                     full_text = "".join(text_parts).strip()
++                    if planned_text is not None and planned_token_cursor != len(planned_token_ids):
++                        await self._send_error(
++                            websocket,
++                            "input.done received before every planned token was sent "
++                            f"({planned_token_cursor}/{len(planned_token_ids)})",
++                        )
++                        continue
+                     text_parts.clear()
+                     total_sentences = 0
+-                    if full_text:
++                    if config.model_streaming_input and generation_task is not None:
++                        assert model_input_queue is not None
++                        await model_input_queue.put(None)
++                        try:
++                            await asyncio.wait_for(
++                                generation_task,
++                                timeout=self._model_streaming_finalize_timeout,
++                            )
++                        except asyncio.TimeoutError:
++                            await self._send_error(
++                                websocket,
++                                "Model streaming finalization timed out after "
++                                f"{self._model_streaming_finalize_timeout:g}s; request aborted",
++                            )
++                            await cancel_generation()
++                        generation_task = None
++                        model_input_queue = None
++                        total_sentences = 1
++                    elif full_text:
+                         # However long the buffered text is, the pipeline takes
+                         # it as one request, so every flush is sentence 0 of 1.
+                         await self._generate_and_send(
+@@ -181,6 +346,13 @@ class OmniStreamingSpeechHandler:
+                         )
+                         total_sentences = 1
+ 
++                    planned_text = None
++                    planned_token_ids = []
++                    planned_token_pieces = []
++                    planned_header_ids = []
++                    planned_footer_ids = []
++                    planned_token_cursor = 0
++
+                     await websocket.send_json(
+                         {
+                             "type": "session.done",
+@@ -191,6 +363,7 @@ class OmniStreamingSpeechHandler:
+                     utterance_index += 1
+ 
+                 elif msg_type == "session.close":
++                    await cancel_generation()
+                     await websocket.close()
+                     return
+ 
+@@ -201,8 +374,10 @@ class OmniStreamingSpeechHandler:
+                     )
+ 
+         except WebSocketDisconnect:
++            await cancel_generation()
+             logger.info("Streaming speech: client disconnected")
+         except Exception as e:
++            await cancel_generation()
+             logger.exception("Streaming speech session error: %s", e)
+             try:
+                 await self._send_error(websocket, f"Internal error: {e}")
+@@ -255,6 +430,35 @@ class OmniStreamingSpeechHandler:
+ 
+         return config
+ 
++    def _tokenize_qwen3_tts_plan(self, text: str) -> tuple[list[int], list[str], list[int], list[int]]:
++        """Tokenize a complete utterance once and expose its content span.
++
++        The header/footer slices mirror ``Qwen3TTSPromptEmbedsBuilder``. They
++        remain on the initial request while only content token ids are sent as
++        live updates, so concatenating every batch is exactly equivalent to
++        normal full-text tokenization.
++        """
++        tokenizer = self._speech_service._get_usage_text_tokenizer()
++        if tokenizer is None:
++            raise RuntimeError("the Qwen3-TTS tokenizer is unavailable")
++        encoded = tokenizer(build_assistant_text(text), padding=False)["input_ids"]
++        if encoded and isinstance(encoded[0], list):
++            encoded = encoded[0]
++        assistant_ids = [int(token_id) for token_id in encoded]
++        if len(assistant_ids) < 9:
++            raise ValueError(f"unexpected assistant prompt length: {len(assistant_ids)}")
++        content_ids = assistant_ids[3:-5]
++        if not content_ids:
++            raise ValueError("input.plan produced no content tokens")
++        token_pieces: list[str] = []
++        for token_id in content_ids:
++            try:
++                piece = tokenizer.convert_ids_to_tokens(token_id)
++            except Exception:
++                piece = tokenizer.decode([token_id], skip_special_tokens=False)
++            token_pieces.append(str(piece))
++        return content_ids, token_pieces, assistant_ids[:3], assistant_ids[-5:]
++
+     async def _generate_and_send(
+         self,
+         websocket: WebSocket,
+@@ -263,6 +467,8 @@ class OmniStreamingSpeechHandler:
+         *,
+         utterance_index: int,
+         sentence_index: int,
++        streaming_text_input=None,
++        streaming_initial_text_token_ids: list[int] | None = None,
+     ) -> None:
+         """Generate audio for a single sentence and send it over WebSocket.
+ 
+@@ -315,6 +521,7 @@ class OmniStreamingSpeechHandler:
+             "sentence_index": sentence_index,
+             "sentence_text": sentence_text,
+             "format": response_format,
++            "model_streaming_input": getattr(config, "model_streaming_input", False) is True,
+         }
+         if config.stream_audio and response_format == "pcm":
+             # Nominal stream rate; each audio.chunk carries the authoritative
+@@ -329,7 +536,15 @@ class OmniStreamingSpeechHandler:
+         request_id = None
+         try:
+             if config.stream_audio:
+-                request_id, generator, _ = await self._speech_service._prepare_speech_generation(request)
++                if streaming_text_input is None:
++                    request_id, generator, _ = await self._speech_service._prepare_speech_generation(request)
++                else:
++                    prepare_kwargs = {"streaming_text_input": streaming_text_input}
++                    if streaming_initial_text_token_ids is not None:
++                        prepare_kwargs["streaming_initial_text_token_ids"] = streaming_initial_text_token_ids
++                    request_id, generator, _ = await self._speech_service._prepare_speech_generation(
++                        request, **prepare_kwargs
++                    )
+                 if config.word_timestamps:
+                     total_bytes = await self._stream_audio_with_alignments(
+                         websocket=websocket,
+@@ -349,6 +564,14 @@ class OmniStreamingSpeechHandler:
+                 audio_bytes, _ = await self._speech_service._generate_audio_bytes(request)
+                 total_bytes = len(audio_bytes)
+                 await websocket.send_bytes(audio_bytes)
++        except asyncio.CancelledError:
++            generation_failed = True
++            if request_id is not None:
++                try:
++                    await self._speech_service.engine_client.abort(request_id)
++                except Exception:
++                    logger.debug("Failed to abort cancelled streaming speech request %s", request_id, exc_info=True)
++            raise
+         except WebSocketDisconnect:
+             if request_id is not None:
+                 try:
+diff --git a/vllm_omni/model_executor/models/qwen3_tts/prompt_embeds_builder.py b/vllm_omni/model_executor/models/qwen3_tts/prompt_embeds_builder.py
+index 0d8f032..c875fa0 100644
+--- a/vllm_omni/model_executor/models/qwen3_tts/prompt_embeds_builder.py
++++ b/vllm_omni/model_executor/models/qwen3_tts/prompt_embeds_builder.py
+@@ -375,6 +375,73 @@ class Qwen3TTSPromptEmbedsBuilder:
+             self._text_tokenizer = tok
+         return self._text_tokenizer
+ 
++    @torch.inference_mode()
++    def build_streaming_text_hidden_from_token_ids(
++        self,
++        token_ids: list[int] | tuple[int, ...] | torch.Tensor,
++        *,
++        append_eos: bool = True,
++    ) -> torch.Tensor:
++        """Project already-tokenized incremental text into the Talker queue.
++
++        Live text must be tokenized as one continuous utterance before it is
++        split into transport batches. Tokenizing every received fragment in
++        isolation changes BPE boundaries (dramatically so for English) and
++        makes the dual-track conditioning differ from regular inference.
++        """
++        dev = self._device()
++        if isinstance(token_ids, torch.Tensor):
++            ids = token_ids.to(device=dev, dtype=torch.long).reshape(-1)
++        else:
++            ids = torch.as_tensor(token_ids, device=dev, dtype=torch.long).reshape(-1)
++
++        parts: list[torch.Tensor] = []
++        if ids.numel() > 0:
++            parts.append(self._text_projection(self._text_embedding(ids.unsqueeze(0))))
++        if append_eos:
++            eos_ids = torch.tensor(
++                [[self._config.tts_eos_token_id]],
++                device=dev,
++                dtype=torch.long,
++            )
++            parts.append(self._text_projection(self._text_embedding(eos_ids)))
++        if not parts:
++            return torch.empty(
++                (0, int(self._talker_config.hidden_size)),
++                device=dev,
++                dtype=self._embedding_dtype,
++            )
++        return torch.cat(parts, dim=1).squeeze(0)
++
++    @torch.inference_mode()
++    def build_streaming_text_hidden(
++        self,
++        text_delta: str,
++        *,
++        append_eos: bool = True,
++    ) -> torch.Tensor:
++        """Project one incremental text fragment into the Talker text queue.
++
++        Each fragment is wrapped with the same assistant template as regular
++        inference, then only the content token span is retained. A terminal
++        TTS-EOS row is appended so the current request can still finish
++        naturally if the text producer pauses or closes.
++        """
++        content_ids: torch.Tensor | list[int] = []
++        if isinstance(text_delta, str) and text_delta:
++            tok = self.get_text_tokenizer()
++            input_ids = tok(
++                build_assistant_text(text_delta),
++                return_tensors="pt",
++                padding=False,
++            )["input_ids"]
++            if int(input_ids.shape[1]) < 8:
++                raise ValueError(
++                    f"Unexpected Qwen3-TTS streaming assistant prompt length: {int(input_ids.shape[1])}"
++                )
++            content_ids = input_ids[:, 3:-5].reshape(-1)
++        return self.build_streaming_text_hidden_from_token_ids(content_ids, append_eos=append_eos)
++
+     # -------------------- ref-audio handling --------------------
+ 
+     def load_audio_to_np(self, x: str) -> tuple[np.ndarray, int]:
+diff --git a/vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_code2wav.py b/vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_code2wav.py
+index 6a5866c..350143e 100644
+--- a/vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_code2wav.py
++++ b/vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_code2wav.py
+@@ -74,13 +74,21 @@ class Qwen3TTSCode2Wav(nn.Module):
+         self._decode_variable_chunk_batch_min_frames = self._decode_chunk_frames + self._decode_left_context_frames + 1
+         self._logged_codec_stats = False
+         self._logged_malformed_codec_lengths: set[tuple[int, int]] = set()
+-        self._batch_stats_enabled = os.environ.get("VLLM_OMNI_QWEN3_CODE2WAV_BATCH_STATS", "").lower() in (
++        batch_stats_flag = os.environ.get(
++            "QWEN3_TTS_CODE2WAV_BATCH_STATS",
++            os.environ.get("VLLM_OMNI_QWEN3_CODE2WAV_BATCH_STATS", ""),
++        )
++        self._batch_stats_enabled = batch_stats_flag.lower() in (
+             "1",
+             "true",
+             "yes",
+             "on",
+         )
+-        self._batch_stats_log_every = int(os.environ.get("VLLM_OMNI_QWEN3_CODE2WAV_BATCH_STATS_LOG_EVERY", "0") or 0)
++        batch_stats_log_every = os.environ.get(
++            "QWEN3_TTS_CODE2WAV_BATCH_STATS_LOG_EVERY",
++            os.environ.get("VLLM_OMNI_QWEN3_CODE2WAV_BATCH_STATS_LOG_EVERY", "0"),
++        )
++        self._batch_stats_log_every = int(batch_stats_log_every or 0)
+         self._batch_stats_forwards = 0
+         self._batch_stats_groups = 0
+         self._batch_stats_requests = 0
+diff --git a/vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_talker.py b/vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_talker.py
+index 3daeb4c..c1cd42d 100644
+--- a/vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_talker.py
++++ b/vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_talker.py
+@@ -579,6 +579,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
+         ref_code_list: list[torch.Tensor] = []
+         has_ref_code = False
+         codec_streaming_list: list[torch.Tensor] = []
++        waiting_for_text_list: list[torch.Tensor] = []
+         for info in info_dicts:
+             if not isinstance(info, dict):
+                 ref_code_list.append(torch.empty(0, dtype=torch.long))
+@@ -593,6 +594,19 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
+                     codec_streaming_list.append(
+                         torch.full((int(ac.shape[0]),), int(cs), dtype=torch.int8, device=ac.device)
+                     )
++                tail = info.get("hidden_states", {}).get("trailing_text")
++                text_offset = max(0, int(meta.get("talker_text_offset", 0) or 0))
++                tail_exhausted = not isinstance(tail, torch.Tensor) or text_offset >= int(tail.shape[0])
++                producer_open = meta.get("qwen3_tts_streaming_input_open") is True
++                is_prefill = info.get("_omni_is_prefill") is True
++                waiting_for_text_list.append(
++                    torch.full(
++                        (int(ac.shape[0]),),
++                        int(producer_open and tail_exhausted and not is_prefill),
++                        dtype=torch.int8,
++                        device=ac.device,
++                    )
++                )
+             ref_code = codes.get("ref")
+             if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
+                 ref_code_list.append(ref_code)
+@@ -634,10 +648,89 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
+             mm.setdefault("codes", {})["ref"] = ref_code_list
+         if codec_streaming_list:
+             mm.setdefault("meta", {})["codec_streaming"] = torch.cat(codec_streaming_list, dim=0)[:span_len]
++        if waiting_for_text_list:
++            mm.setdefault("meta", {})["qwen3_tts_waiting_for_text"] = torch.cat(
++                waiting_for_text_list,
++                dim=0,
++            )[:span_len]
+         return OmniOutput(text_hidden_states=hidden, multimodal_outputs=mm)
+ 
+     # -------------------- preprocess / postprocess --------------------
+ 
++    def _append_streaming_text_conditioning(
++        self,
++        info_dict: dict[str, Any],
++        *,
++        device: torch.device,
++        dtype: torch.dtype,
++    ) -> bool:
++        """Consume a live text delta into the remaining dual-track queue."""
++        text_delta = info_dict.get("qwen3_tts_streaming_text_delta")
++        text_delta = text_delta if isinstance(text_delta, str) else ""
++        token_ids_raw = info_dict.get("qwen3_tts_streaming_text_token_ids")
++        if isinstance(token_ids_raw, torch.Tensor):
++            token_ids = [int(token_id) for token_id in token_ids_raw.reshape(-1).tolist()]
++        elif isinstance(token_ids_raw, list | tuple) and all(
++            isinstance(token_id, int) and not isinstance(token_id, bool) for token_id in token_ids_raw
++        ):
++            token_ids = [int(token_id) for token_id in token_ids_raw]
++        else:
++            token_ids = []
++        input_done = info_dict.get("qwen3_tts_streaming_input_done") is True
++        if not text_delta and not token_ids and not input_done:
++            return False
++
++        payload: OmniPayload = info_dict
++        hs = payload.setdefault("hidden_states", {})
++        meta = payload.setdefault("meta", {})
++        tail = hs.get("trailing_text")
++        text_offset = max(0, int(meta.get("talker_text_offset", 0) or 0))
++        if isinstance(tail, torch.Tensor) and tail.ndim == 2:
++            remaining = tail[min(text_offset, int(tail.shape[0])) :]
++            # Every independently-tokenized fragment ends in a TTS-EOS text
++            # row. While the producer is still appending text that terminal row
++            # becomes an interior boundary and must be replaced, not retained.
++            if bool(meta.get("trailing_text_has_eos", False)) and int(remaining.shape[0]) > 0:
++                remaining = remaining[:-1]
++            remaining = remaining.to(device=device, dtype=dtype)
++        else:
++            remaining = torch.empty(
++                (0, int(self.talker_config.hidden_size)),
++                device=device,
++                dtype=dtype,
++            )
++
++        if token_ids:
++            appended = self._prompt_builder.build_streaming_text_hidden_from_token_ids(
++                token_ids,
++                append_eos=input_done,
++            )
++        else:
++            appended = self._prompt_builder.build_streaming_text_hidden(
++                text_delta,
++                append_eos=input_done,
++            )
++        appended = appended.to(
++            device=device,
++            dtype=dtype,
++        )
++        new_tail = torch.cat((remaining, appended), dim=0)
++        hs["trailing_text"] = new_tail.detach()
++        meta["talker_text_offset"] = 0
++        meta["trailing_text_has_eos"] = input_done
++        meta["qwen3_tts_streaming_input_open"] = not input_done
++        logger.debug(
++            "Qwen3-TTS live text applied: delta_chars=%d token_ids=%d done=%s remaining_rows=%d "
++            "appended_rows=%d tail_rows=%d",
++            len(text_delta),
++            len(token_ids),
++            input_done,
++            int(remaining.shape[0]),
++            int(appended.shape[0]),
++            int(new_tail.shape[0]),
++        )
++        return True
++
+     def preprocess(
+         self,
+         input_ids: torch.Tensor,
+@@ -689,6 +782,16 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
+         # and the decode text-step fallback below.
+         dtype = self._embedding_dtype
+         tts_pad_embed = self._tts_pad_embed.to(device=input_ids.device, dtype=dtype).reshape(1, -1)
++        consumed_streaming_delta = self._append_streaming_text_conditioning(
++            info_dict,
++            device=input_ids.device,
++            dtype=dtype,
++        )
++        # The helper updates the nested dictionaries in-place; refresh the
++        # local aliases because a sparse continuation payload may have created
++        # them above.
++        hs = info_dict.get("hidden_states", hs)
++        meta = info_dict.get("meta", meta)
+ 
+         if is_prefill:
+             # Prefill (prompt embeddings)
+@@ -700,6 +803,15 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
+                 full_prompt_embeds, tailing_text_hidden, ref_code_len, ref_code = (
+                     self._prompt_builder.build_prompt_embeds(task_type=task_type, info_dict=info_dict)
+                 )
++                streaming_input_raw = info_dict.get("qwen3_tts_streaming_input_open")
++                if isinstance(streaming_input_raw, list):
++                    streaming_input_raw = streaming_input_raw[0] if streaming_input_raw else False
++                streaming_input_open = streaming_input_raw is True
++                if streaming_input_open and int(tailing_text_hidden.shape[0]) > 0:
++                    # The normal dual-track prompt ends with text EOS. A live
++                    # producer has not ended yet, so hold this row until the
++                    # explicit input.done metadata update arrives.
++                    tailing_text_hidden = tailing_text_hidden[:-1]
+                 # Store full prompt embeddings on CPU (large, prefill-only).
+                 # tailing_text_hidden stays on GPU (gpu_resident_buffer_keys).
+                 prompt_embeds_cpu = full_prompt_embeds.detach().to("cpu").contiguous()
+@@ -709,6 +821,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
+                     "meta": {
+                         "talker_text_offset": 0,
+                         "codec_streaming": codec_streaming,
++                        "trailing_text_has_eos": not streaming_input_open,
++                        "qwen3_tts_streaming_input_open": streaming_input_open,
+                     },
+                 }
+                 if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
+@@ -725,6 +839,17 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
+                 offset = max(0, int(meta.get("talker_prefill_offset", 0) or 0))
+                 info_update = {"meta": {"codec_streaming": codec_streaming}}
+ 
++            if consumed_streaming_delta:
++                info_update["qwen3_tts_streaming_text_delta"] = ""
++                info_update["qwen3_tts_streaming_text_token_ids"] = []
++                info_update["qwen3_tts_streaming_input_done"] = False
++                info_update.setdefault("meta", {})["qwen3_tts_streaming_input_open"] = bool(
++                    meta.get("qwen3_tts_streaming_input_open", False)
++                )
++                info_update["meta"]["trailing_text_has_eos"] = bool(
++                    meta.get("trailing_text_has_eos", False)
++                )
++
+             # Always return a span_len slice; if the scheduled placeholder is longer than what
+             # the prompt actually fills, pad with tts_pad_embed (preserves placeholder/embedding alignment).
+             s = max(0, min(offset, int(prompt_embeds_cpu.shape[0])))
+@@ -755,7 +880,18 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
+                 .to(device=input_ids.device, dtype=dtype)
+                 .reshape(span_len, -1)
+             )
+-            return input_ids, inputs_embeds_out, {"meta": {"codec_streaming": codec_streaming}}
++            info_update = {"meta": {"codec_streaming": codec_streaming}}
++            if consumed_streaming_delta:
++                info_update["qwen3_tts_streaming_text_delta"] = ""
++                info_update["qwen3_tts_streaming_text_token_ids"] = []
++                info_update["qwen3_tts_streaming_input_done"] = False
++                info_update.setdefault("meta", {})["qwen3_tts_streaming_input_open"] = bool(
++                    meta.get("qwen3_tts_streaming_input_open", False)
++                )
++                info_update["meta"]["trailing_text_has_eos"] = bool(
++                    meta.get("trailing_text_has_eos", False)
++                )
++            return input_ids, inputs_embeds_out, info_update
+ 
+         # Decode: span_len == 1
+         # Pop one text-step vector from tailing_text_hidden queue.
+@@ -815,8 +951,20 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
+                 "codec_streaming": codec_streaming,
+             },
+         }
++        if consumed_streaming_delta:
++            info_update["qwen3_tts_streaming_text_delta"] = ""
++            info_update["qwen3_tts_streaming_text_token_ids"] = []
++            info_update["qwen3_tts_streaming_input_done"] = False
++            info_update.setdefault("meta", {})["qwen3_tts_streaming_input_open"] = bool(
++                meta.get("qwen3_tts_streaming_input_open", False)
++            )
++            info_update["meta"]["trailing_text_has_eos"] = bool(
++                meta.get("trailing_text_has_eos", False)
++            )
+         if trailing_text_update is not None:
+             info_update["hidden_states"] = {"trailing_text": trailing_text_update.detach()}
++            if int(trailing_text_update.shape[0]) == 0:
++                info_update["meta"]["trailing_text_has_eos"] = False
+         return input_ids, inputs_embeds_out, info_update
+ 
+     def preprocess_decode_batch(
+@@ -858,6 +1006,14 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
+             hs = payload.get("hidden_states", {})
+             meta = payload.get("meta", {})
+ 
++            consumed_streaming_delta = self._append_streaming_text_conditioning(
++                info_dict,
++                device=device,
++                dtype=dtype,
++            )
++            hs = info_dict.get("hidden_states", hs)
++            meta = info_dict.get("meta", meta)
++
+             if not _has_tts_text_conditioning(info_dict, hs):
+                 raise ValueError("Missing Qwen3-TTS text conditioning: provide `text` or precomputed text token ids.")
+ 
+@@ -910,8 +1066,20 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
+                     "codec_streaming": codec_streaming,
+                 },
+             }
++            if consumed_streaming_delta:
++                info_update["qwen3_tts_streaming_text_delta"] = ""
++                info_update["qwen3_tts_streaming_text_token_ids"] = []
++                info_update["qwen3_tts_streaming_input_done"] = False
++                info_update.setdefault("meta", {})["qwen3_tts_streaming_input_open"] = bool(
++                    meta.get("qwen3_tts_streaming_input_open", False)
++                )
++                info_update["meta"]["trailing_text_has_eos"] = bool(
++                    meta.get("trailing_text_has_eos", False)
++                )
+             if trailing_text_update is not None:
+                 info_update["hidden_states"] = {"trailing_text": trailing_text_update.detach()}
++                if int(trailing_text_update.shape[0]) == 0:
++                    info_update["meta"]["trailing_text_has_eos"] = False
+             updates.append(info_update)
+ 
+         inputs_embeds_out = self.embed_input_ids(input_ids_flat.reshape(-1, 1).to(torch.long)).to(
