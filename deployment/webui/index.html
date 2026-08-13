@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#090b10" />
     <title>Qwen3 TTS Pro</title>
-    <link rel="stylesheet" href="/static/style.css?v=18" />
-    <script src="/static/app.js?v=18" defer></script>
+    <link rel="stylesheet" href="/static/style.css?v=19" />
+    <script src="/static/app.js?v=19" defer></script>
   </head>
   <body>
     <div class="ambient ambient-one"></div>
@@ -28,6 +28,8 @@
         <div class="top-actions">
           <div class="model-chip" title="当前加载的模型">
             <span class="model-dot"></span>
+            <span class="runtime-version">vLLM 0.26</span>
+            <span class="chip-divider" aria-hidden="true"></span>
             <span>1.7B CustomVoice</span>
           </div>
           <button id="backendStatus" class="status-pill checking" type="button" title="点击重新检测服务">
@@ -210,7 +212,7 @@
       </section>
 
       <footer>
-        <span>Qwen3-TTS-Pro · vLLM-Omni</span>
+        <span>Qwen3-TTS-Pro · vLLM 0.26 + vLLM-Omni 0.26</span>
         <span class="footer-dot"></span>
         <span>24 kHz · Model-level Token Streaming</span>
       </footer>

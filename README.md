@@ -4,9 +4,11 @@
 
 **面向 Qwen3-TTS 的高并发、模型级双流推理与可视化工程层**
 
+[![CI](https://github.com/QuadraV-Speech/Qwen3-TTS-Pro/actions/workflows/ci.yml/badge.svg)](https://github.com/QuadraV-Speech/Qwen3-TTS-Pro/actions/workflows/ci.yml)
 [![Version](https://img.shields.io/badge/version-v0.1.0--preview-8b6cff?style=flat-square)](CHANGELOG.md)
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white)](docs/installation.md)
-[![vLLM](https://img.shields.io/badge/vLLM-0.26.0-45B8AC?style=flat-square)](docs/installation.md)
+[![vLLM](https://img.shields.io/badge/vLLM-0.26.0%2Bcu129-45B8AC?style=flat-square)](docs/installation.md)
+[![vLLM Omni](https://img.shields.io/badge/vLLM--Omni-v0.26.0-2F9E91?style=flat-square)](patches/README.md)
 [![Model](https://img.shields.io/badge/Qwen3--TTS-12Hz%201.7B-6F52ED?style=flat-square)](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice)
 [![License](https://img.shields.io/badge/License-Apache--2.0-EA7E20?style=flat-square)](LICENSE)
 
@@ -91,7 +93,7 @@ session.config
   <img src="docs/assets/qwen3_tts_architecture_12hz_1.7b.png" width="92%" alt="Qwen3-TTS-Pro system architecture">
 </p>
 
-工程运行在 vLLM / vLLM-Omni `0.26.0` 之上。Stage 0 执行 Talker 与 MTP 自回归，Stage 1 将分层 Codec 表示增量解码成 `24 kHz PCM16`；两阶段通过支持流式 Chunk 的共享内存连接器衔接。
+当前实测运行时是 **vLLM `0.26.0+cu129` + vLLM-Omni `v0.26.0`**，增强补丁基于 vLLM-Omni 提交 `a4ea67a`。Stage 0 执行 Talker 与 MTP 自回归，Stage 1 将分层 Codec 表示增量解码成 `24 kHz PCM16`；两阶段通过支持流式 Chunk 的共享内存连接器衔接。
 
 更完整的模块边界见 [系统架构说明](docs/architecture.md)，音频解码原理见 [Codec Token 如何变成波形](docs/CODEC_TO_WAVEFORM.md)。
 
@@ -113,7 +115,7 @@ session.config
 本项目不要求克隆或安装 Qwen3-TTS 官方 Python 仓库。运行时初始化脚本会获取固定版本的 vLLM-Omni，并应用本项目可审阅补丁。
 
 ```bash
-git clone <your-qwen3-tts-pro-repository-url>
+git clone https://github.com/QuadraV-Speech/Qwen3-TTS-Pro.git
 cd Qwen3-TTS-Pro
 
 ./scripts/setup_runtime.sh

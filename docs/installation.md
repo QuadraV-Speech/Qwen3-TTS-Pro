@@ -16,7 +16,7 @@
 ## 2. 获取仓库
 
 ```bash
-git clone <your-qwen3-tts-pro-repository-url>
+git clone https://github.com/QuadraV-Speech/Qwen3-TTS-Pro.git
 cd Qwen3-TTS-Pro
 ```
 
@@ -81,7 +81,7 @@ deactivate
 VLLM_OMNI_SOURCE_DIR=third_party/vllm-omni ./scripts/validate_repo.sh
 ```
 
-预期版本分别为 vLLM `0.26.0` 和 vLLM-Omni `0.26.0`，补丁应被识别为已应用。
+使用默认脚本时，预期版本分别为 vLLM `0.26.0+cu129` 和 vLLM-Omni `0.26.0`。前者的 `+cu129` 是默认 wheel 的 CUDA 构建标记；通过 `VLLM_WHEEL` 选择其他官方构建时，后缀可以不同，但核心版本必须保持 `0.26.0`。后者对应 tag `v0.26.0`、提交 `a4ea67a`；补丁应被识别为已应用。
 
 ## 6. 模型缓存与离线运行
 

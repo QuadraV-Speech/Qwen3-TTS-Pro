@@ -7,7 +7,7 @@ the disabled baseline because the normalized audio-throughput gain was only
 ## Setup
 
 - Model: `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`
-- Runtime: vLLM/vLLM-Omni 0.26.0
+- Runtime: vLLM 0.26.0+cu129 + vLLM-Omni v0.26.0
 - Device: one A100-SXM4-80GB, shared with an unrelated process using about
   13.1 GiB
 - Dataset: Seed-TTS text smoke set, oversampled to the requested count

@@ -5,7 +5,8 @@
 测试日期：2026-08-11。
 
 - 模型：`Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`
-- vLLM / vLLM-Omni：`0.26.0`
+- vLLM：`0.26.0+cu129`
+- vLLM-Omni：`v0.26.0`
 - GPU：单张 A100-SXM4-80GB
 - 同卡其他进程占用：约 13.1 GiB
 - 数据集：vLLM-Omni `seed_tts_smoke`

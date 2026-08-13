@@ -3,7 +3,8 @@
 Qwen3-TTS-Pro `v0.1.0-preview` 是独立的 Qwen3-TTS 工程增强层，当前针对：
 
 - 模型：`Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`
-- 推理框架：vLLM / vLLM-Omni `0.26.0`
+- 推理框架：vLLM `0.26.0+cu129`
+- 多阶段运行时：vLLM-Omni `v0.26.0`（基线提交 `a4ea67a`）
 - 输出：24 kHz 单声道 PCM16 或完整音频文件
 
 ## 1. 模型级增量文本输入

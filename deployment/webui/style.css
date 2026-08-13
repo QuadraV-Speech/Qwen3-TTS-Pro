@@ -207,6 +207,17 @@ select {
   transform: rotate(45deg);
 }
 
+.runtime-version {
+  color: #c1b5f3;
+  font-weight: 650;
+}
+
+.chip-divider {
+  width: 1px;
+  height: 13px;
+  background: rgba(255, 255, 255, 0.1);
+}
+
 .status-pill {
   min-width: 105px;
   justify-content: center;

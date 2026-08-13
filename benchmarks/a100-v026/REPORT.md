@@ -6,7 +6,7 @@
 
 - 模型：`Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`
 - GPU：单张 NVIDIA A100-SXM4-80GB；另有无关进程同卡占用约 13.1 GiB
-- 服务：vLLM 0.26.0 + vLLM-Omni 0.26.0，CUDA 12.9
+- 服务：vLLM 0.26.0+cu129 + vLLM-Omni v0.26.0，CUDA 12.9
 - 测试：官方 `seed_tts_smoke`，Vivian / English / CustomVoice，突发请求，每组预热 2 条
 - 优化：Talker 与 Code2Wav 均允许 64 个在途序列；启用 async scheduling、CUDA Graph、共享内存流式传输，以及 v0.26 的 Code2Wav 同长度音频块合批
 - 对照：同一台机器、同一张 GPU、同一模型与数据集上的 v0.20 旧服务
